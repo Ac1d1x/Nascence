@@ -1284,6 +1284,13 @@ public final class TermuxOverlayManager {
                         longPressed = false;
 
                         if (!dragging) {
+                            if (velocityY > minFling) {
+                                // A short, fast downward flick never moved past the touch slop, so
+                                // it used to be treated as a tap and collapsed the sheet. Use it to
+                                // wake the IME instead, leaving the sheet where it is.
+                                showKeyboard();
+                                return true;
+                            }
                             // A tap on the handle toggles the sheet.
                             if (mCollapsed) animateHeightTo(expandedHeight(), 0f, null);
                             else animateHeightTo(peekHeight(), 0f,
