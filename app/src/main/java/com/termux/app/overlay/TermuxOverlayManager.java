@@ -84,12 +84,9 @@ public final class TermuxOverlayManager {
     public static final String ACTION_TOGGLE_OVERLAY = "com.termux.app.action.TOGGLE_OVERLAY";
 
     private static final String LOG_TAG = "TermuxOverlayManager";
-    /** Overlay preferences, shared with the activity's extra-keys switch. */
-    public static final String PREFERENCES_NAME = "nascence_overlay";
+    private static final String PREFS_NAME = "nascence_overlay";
     private static final String KEY_ENABLED = "enabled";
     private static final String KEY_HEIGHT_FRACTION = "height_fraction";
-    /** Whether long-pressing the handle may show the extra keys row. */
-    public static final String KEY_EXTRA_KEYS_ENABLED = "extra_keys_enabled";
 
     private static final float DEFAULT_HEIGHT_FRACTION = 0.5f;
     private static final float MIN_HEIGHT_FRACTION = 0.08f;
@@ -171,7 +168,7 @@ public final class TermuxOverlayManager {
     public TermuxOverlayManager(@NonNull TermuxService service) {
         mService = service;
         mWindowManager = (WindowManager) service.getSystemService(Context.WINDOW_SERVICE);
-        mPreferences = service.getSharedPreferences(PREFERENCES_NAME, Context.MODE_PRIVATE);
+        mPreferences = service.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
         mViewClient = new TermuxOverlayViewClient(service, this);
 
         TermuxAppSharedPreferences preferences = TermuxAppSharedPreferences.build(service);
@@ -1042,8 +1039,6 @@ public final class TermuxOverlayManager {
 
     private void toggleExtraKeys() {
         if (mExtraKeysView == null || mCollapsed || mExtraKeysHeight <= 0) return;
-        // The drawer's "Extra keys" checkbox decides whether the row can be summoned at all.
-        if (!mPreferences.getBoolean(KEY_EXTRA_KEYS_ENABLED, true)) return;
         setExtraKeysVisible(!mExtraKeysVisible);
     }
 

@@ -9,7 +9,6 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.ServiceConnection;
-import android.content.SharedPreferences;
 import android.graphics.Color;
 import android.net.Uri;
 import android.os.Build;
@@ -37,7 +36,6 @@ import android.widget.Toast;
 
 import com.termux.R;
 import com.termux.app.api.file.FileReceiverActivity;
-import com.termux.app.overlay.TermuxOverlayManager;
 import com.termux.app.terminal.TermuxActivityRootView;
 import com.termux.app.terminal.TerminalThemeLibrary;
 import com.termux.app.terminal.TermuxTerminalSessionActivityClient;
@@ -629,12 +627,8 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
 
         final boolean showNow = mPreferences.toogleShowTerminalToolbar();
         Logger.showToast(this, (showNow ? getString(R.string.msg_enabling_terminal_toolbar) : getString(R.string.msg_disabling_terminal_toolbar)), true);
-        terminalToolbarViewPager.setVisibility(showNow ? View.VISIBLE : View.GONE);
-        updateScrollToBottomButtonPosition();
-        if (showNow && isTerminalToolbarTextInputViewSelected()) {
-            // Focus the text input view if just revealed.
-            findViewById(R.id.terminal_toolbar_text_input).requestFocus();
-        }
+        showTerminalToolbar(showNow);
+        syncExtraKeysSwitch(showNow);
     }
 
     private void saveTerminalToolbarTextInput(Bundle savedInstanceState) {
@@ -657,21 +651,35 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
     }
 
     /**
-     * Toggles the floating terminal's extra keys row (the small keyboard summoned by long-pressing
-     * the sheet handle). Persisted in the overlay preferences so the service sees it immediately.
+     * The drawer's "Extra keys" checkbox mirrors and controls the main app's terminal toolbar
+     * visibility, the same preference the keyboard button's long press toggles.
      */
     private void setExtraKeysSwitchView() {
         CheckBox switchView = findViewById(R.id.extra_keys_switch);
-        if (switchView == null) return;
+        if (switchView == null || mPreferences == null) return;
 
-        SharedPreferences preferences = getSharedPreferences(
-            TermuxOverlayManager.PREFERENCES_NAME, MODE_PRIVATE);
-        switchView.setChecked(preferences.getBoolean(
-            TermuxOverlayManager.KEY_EXTRA_KEYS_ENABLED, true));
-        switchView.setOnCheckedChangeListener((buttonView, isChecked) ->
-            preferences.edit()
-                .putBoolean(TermuxOverlayManager.KEY_EXTRA_KEYS_ENABLED, isChecked)
-                .apply());
+        switchView.setChecked(mPreferences.shouldShowTerminalToolbar());
+        switchView.setOnCheckedChangeListener((buttonView, isChecked) -> {
+            if (mPreferences.shouldShowTerminalToolbar() == isChecked) return;
+            mPreferences.setShowTerminalToolbar(isChecked);
+            showTerminalToolbar(isChecked);
+        });
+    }
+
+    private void showTerminalToolbar(boolean show) {
+        final ViewPager terminalToolbarViewPager = getTerminalToolbarViewPager();
+        if (terminalToolbarViewPager == null) return;
+        terminalToolbarViewPager.setVisibility(show ? View.VISIBLE : View.GONE);
+        updateScrollToBottomButtonPosition();
+        if (show && isTerminalToolbarTextInputViewSelected()) {
+            findViewById(R.id.terminal_toolbar_text_input).requestFocus();
+        }
+    }
+
+    /** Keeps the drawer checkbox in sync when the toolbar is toggled from elsewhere. */
+    private void syncExtraKeysSwitch(boolean show) {
+        CheckBox switchView = findViewById(R.id.extra_keys_switch);
+        if (switchView != null && switchView.isChecked() != show) switchView.setChecked(show);
     }
 
     private void setNewSessionButtonView() {
