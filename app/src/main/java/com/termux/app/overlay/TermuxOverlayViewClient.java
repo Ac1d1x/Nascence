@@ -8,6 +8,7 @@ import android.view.View;
 import androidx.annotation.NonNull;
 
 import com.termux.shared.logger.Logger;
+import com.termux.shared.termux.extrakeys.SpecialButton;
 import com.termux.shared.termux.settings.properties.TermuxAppSharedProperties;
 import com.termux.terminal.TerminalSession;
 import com.termux.view.TerminalViewClient;
@@ -115,22 +116,22 @@ final class TermuxOverlayViewClient implements TerminalViewClient {
 
     @Override
     public boolean readControlKey() {
-        return mCtrlDown;
+        return mCtrlDown || mManager.readExtraKeysSpecialButton(SpecialButton.CTRL);
     }
 
     @Override
     public boolean readAltKey() {
-        return mAltDown;
+        return mAltDown || mManager.readExtraKeysSpecialButton(SpecialButton.ALT);
     }
 
     @Override
     public boolean readShiftKey() {
-        return false;
+        return mManager.readExtraKeysSpecialButton(SpecialButton.SHIFT);
     }
 
     @Override
     public boolean readFnKey() {
-        return false;
+        return mManager.readExtraKeysSpecialButton(SpecialButton.FN);
     }
 
     @Override

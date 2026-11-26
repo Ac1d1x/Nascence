@@ -50,6 +50,7 @@ import com.termux.shared.termux.data.TermuxUrlUtils;
 import com.termux.shared.termux.extrakeys.ExtraKeysConstants;
 import com.termux.shared.termux.extrakeys.ExtraKeysInfo;
 import com.termux.shared.termux.extrakeys.ExtraKeysView;
+import com.termux.shared.termux.extrakeys.SpecialButton;
 import com.termux.shared.termux.settings.preferences.TermuxAppSharedPreferences;
 import com.termux.shared.termux.settings.properties.TermuxAppSharedProperties;
 import com.termux.shared.termux.settings.properties.TermuxPropertyConstants;
@@ -1039,6 +1040,16 @@ public final class TermuxOverlayManager {
     private void toggleExtraKeys() {
         if (mExtraKeysView == null || mCollapsed || mExtraKeysHeight <= 0) return;
         setExtraKeysVisible(!mExtraKeysVisible);
+    }
+
+    /**
+     * Reads a modifier from the extra keys row. Like the main app, the active state is consumed on
+     * read so it applies to the next key or IME character only.
+     */
+    boolean readExtraKeysSpecialButton(SpecialButton specialButton) {
+        if (mExtraKeysView == null) return false;
+        Boolean state = mExtraKeysView.readSpecialButton(specialButton, true);
+        return state != null && state;
     }
 
     /** Shows or hides the extra keys row with a short expand/collapse animation. */
