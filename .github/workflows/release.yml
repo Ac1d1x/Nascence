@@ -21,19 +21,21 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: Build debug APKs
+      - name: Build release APKs
         shell: bash
         run: |
           set -euo pipefail
           # Use the release tag (v0.1.0 -> 0.1.0) as the APK versionName.
           export TERMUX_APP_VERSION_NAME="${GITHUB_REF_NAME#v}"
-          ./gradlew assembleDebug
+          # Release builds default to a single universal APK; also produce per-ABI splits.
+          export TERMUX_SPLIT_APKS_FOR_RELEASE_BUILDS=1
+          ./gradlew assembleRelease
 
       - name: Generate checksums
         shell: bash
         run: |
           set -euo pipefail
-          cd app/build/outputs/apk/debug
+          cd app/build/outputs/apk/release
           sha256sum *.apk > "Nascence-${GITHUB_REF_NAME}-sha256sums.txt"
 
       - name: Create GitHub release
@@ -42,6 +44,6 @@ jobs:
           name: Nascence ${{ github.ref_name }}
           body: 首个发行版
           files: |
-            app/build/outputs/apk/debug/*.apk
-            app/build/outputs/apk/debug/*-sha256sums.txt
+            app/build/outputs/apk/release/*.apk
+            app/build/outputs/apk/release/*-sha256sums.txt
           fail_on_unmatched_files: true
