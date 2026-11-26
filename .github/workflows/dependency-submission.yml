@@ -10,6 +10,9 @@ permissions:
 
 jobs:
   dependency-submission:
+    # Dependency submission is only meaningful for the upstream repo. In forks the dependency
+    # graph is disabled, so every push would otherwise fail this job.
+    if: github.repository == 'termux/termux-app'
     runs-on: ubuntu-latest
     steps:
     - name: Checkout sources
