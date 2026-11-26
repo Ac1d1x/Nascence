@@ -251,3 +251,9 @@ afterEvaluate {
         variant.javaCompileProvider.get().dependsOn(downloadBootstraps)
     }
 }
+
+// The bootstrap zips are incbin'd into the native library, so no NDK build may start before they
+// exist. Without this a clean clone (and CI) can compile termux-bootstrap-zip.S first and fail.
+tasks.matching { it.name.startsWith("buildNdkBuild") }.configureEach {
+    dependsOn(downloadBootstraps)
+}
