@@ -42,6 +42,9 @@ import com.termux.terminal.TerminalEmulator;
 import com.termux.terminal.TerminalSession;
 import com.termux.view.textselection.TextSelectionCursorController;
 
+import java.util.ArrayList;
+import java.util.List;
+
 /** View displaying and interacting with a {@link TerminalSession}. */
 public final class TerminalView extends View {
 
@@ -66,8 +69,39 @@ public final class TerminalView extends View {
     public static final int TERMINAL_CURSOR_BLINK_RATE_MIN = 100;
     public static final int TERMINAL_CURSOR_BLINK_RATE_MAX = 2000;
 
-    /** The top row of text to display. Ranges from -activeTranscriptRows to 0. */
+    /** The target top row of text to display. Ranges from -activeTranscriptRows to 0. */
     int mTopRow;
+    /** Fractional top row currently rendered, eased towards {@link #mTopRow} for smooth scrolling. */
+    float mDisplayTopRow;
+    boolean mScrollAnimating;
+    long mScrollLastFrameTimeMs = SystemClock.uptimeMillis();
+
+    /** Wait this long after the user last interacted before auto-scrolling to new output. */
+    private static final long AUTO_SCROLL_SUPPRESS_MS = 5000;
+    private long mLastUserInteractionTime;
+
+    /** DECSET 2026 synchronized output: coalesce redraws until the application finishes a frame. */
+    private static final long SYNCHRONIZED_OUTPUT_MAX_MS = 1500;
+    private long mSynchronizedOutputStartTime;
+
+    /** Scrollback search state. */
+    private List<int[]> mSearchHighlights = new ArrayList<>();
+    private int mSearchCurrentIndex = -1;
+    private String mSearchQuery;
+
+    /** Notified when the viewport leaves or reaches the bottom of the transcript. */
+    public interface ScrollListener {
+        void onScrollChanged(boolean atBottom);
+    }
+    private ScrollListener mScrollListener;
+
+    /** Smooth zoom when the font size changes (pinch or font size preference). */
+    private static final long ZOOM_ANIMATION_DURATION_MS = 140;
+    private boolean mZoomAnimating;
+    private long mZoomAnimStartTime;
+    private float mZoomScaleFrom = 1f;
+    private float mZoomScaleTo = 1f;
+    private float mZoomScale = 1f;
     int[] mDefaultSelectors = new int[]{-1,-1,-1,-1};
 
     float mScaleFactor = 1.f;
@@ -175,12 +209,17 @@ public final class TerminalView extends View {
                     // since we cannot just start sending these events without a starting press event,
                     // which we do not do for touch input, only mouse in onTouchEvent().
                     sendMouseEventCode(e, TerminalEmulator.MOUSE_LEFT_BUTTON_MOVED, true);
-                } else {
+                } else if (mEmulator.isMouseTrackingActive() || mEmulator.isAlternateBufferActive()) {
                     scrolledWithFinger = true;
                     distanceY += mScrollRemainder;
                     int deltaRows = (int) (distanceY / mRenderer.mFontLineSpacing);
                     mScrollRemainder = distanceY - deltaRows * mRenderer.mFontLineSpacing;
                     doScroll(e, deltaRows);
+                } else {
+                    scrolledWithFinger = true;
+                    // Track the finger directly with sub-row precision instead of easing towards
+                    // whole-row targets, otherwise fast drags keep gliding after the finger stops.
+                    scrollByRows(distanceY / mRenderer.mFontLineSpacing);
                 }
                 return true;
             }
@@ -231,6 +270,19 @@ public final class TerminalView extends View {
 
             @Override
             public boolean onDown(float x, float y) {
+                // Stop any fling or smooth-scroll chase where it currently is, so a new touch
+                // immediately takes over instead of the content continuing to fly away.
+                if (!mScroller.isFinished()) {
+                    mScroller.forceFinished(true);
+                }
+                if (mScrollAnimating) {
+                    mTopRow = Math.round(mDisplayTopRow);
+                    mDisplayTopRow = mTopRow;
+                    mScrollAnimating = false;
+                    if (mEmulator != null) mEmulator.setTopRow(mTopRow);
+                    notifyScrollListener();
+                }
+
                 // Why is true not returned here?
                 // https://developer.android.com/training/gestures/detector.html#detect-a-subset-of-supported-gestures
                 // Although setting this to true still does not solve the following errors when long pressing in terminal view text area
@@ -449,7 +501,7 @@ public final class TerminalView extends View {
 
     @Override
     protected int computeVerticalScrollOffset() {
-        return mEmulator == null ? 1 : mEmulator.getScreen().getActiveRows() + mTopRow - mEmulator.mRows;
+        return mEmulator == null ? 1 : mEmulator.getScreen().getActiveRows() + Math.round(mDisplayTopRow) - mEmulator.mRows;
     }
 
     public void onScreenUpdated() {
@@ -459,11 +511,27 @@ public final class TerminalView extends View {
     public void onScreenUpdated(boolean skipScrolling) {
         if (mEmulator == null) return;
 
-        int rowsInHistory = mEmulator.getScreen().getActiveTranscriptRows();
-        if (mTopRow < -rowsInHistory) setTopRow(-rowsInHistory);
+        if (mEmulator.isSynchronizedOutput()) {
+            long now = SystemClock.uptimeMillis();
+            if (mSynchronizedOutputStartTime == 0) mSynchronizedOutputStartTime = now;
+            if (now - mSynchronizedOutputStartTime < SYNCHRONIZED_OUTPUT_MAX_MS) {
+                // The application is halfway through a frame; rendering now would show tearing.
+                return;
+            }
+            // A broken application forgot to reset DECSET 2026: keep it from freezing the view.
+            mSynchronizedOutputStartTime = now;
+        } else {
+            mSynchronizedOutputStartTime = 0;
+        }
 
-        if (isSelectingText() || mEmulator.isAutoScrollDisabled()) {
-            // Do not scroll when selecting text.
+        int rowsInHistory = mEmulator.getScreen().getActiveTranscriptRows();
+        if (mTopRow < -rowsInHistory) setTopRowImmediate(-rowsInHistory);
+
+        boolean autoScrollSuppressed = mTopRow != 0 &&
+            (SystemClock.uptimeMillis() - mLastUserInteractionTime) < AUTO_SCROLL_SUPPRESS_MS;
+
+        if (isSelectingText() || mEmulator.isAutoScrollDisabled() || autoScrollSuppressed) {
+            // Do not scroll when selecting text or while the user is reading the scrollback.
             int rowShift = mEmulator.getScrollCounter();
             if (-mTopRow + rowShift > rowsInHistory) {
                 // .. unless we're hitting the end of history transcript, in which
@@ -471,14 +539,16 @@ public final class TerminalView extends View {
                 if (isSelectingText())
                     stopTextSelectionMode();
 
-                if (mEmulator.isAutoScrollDisabled()) {
-                    setTopRow(-rowsInHistory);
+                if (mEmulator.isAutoScrollDisabled() || autoScrollSuppressed) {
+                    setTopRowImmediate(-rowsInHistory);
                     skipScrolling = true;
                 }
             } else {
                 skipScrolling = true;
-                setTopRow(mTopRow - rowShift);
-                decrementYTextSelectionCursors(rowShift);
+                if (rowShift != 0) {
+                    setTopRowImmediate(mTopRow - rowShift);
+                    decrementYTextSelectionCursors(rowShift);
+                }
             }
         }
 
@@ -513,12 +583,25 @@ public final class TerminalView extends View {
      * @param textSize the new font size, in density-independent pixels.
      */
     public void setTextSize(int textSize) {
-        mRenderer = new TerminalRenderer(textSize, mRenderer == null ? Typeface.MONOSPACE : mRenderer.mTypeface);
+        int oldTextSize = mRenderer == null ? textSize : mRenderer.mTextSize;
+        mRenderer = new TerminalRenderer(textSize,
+            mRenderer == null ? Typeface.MONOSPACE : mRenderer.mTypeface,
+            mRenderer == null ? Typeface.MONOSPACE : mRenderer.mBoldTypeface);
+        mRenderer.setSearchHighlights(mSearchHighlights, mSearchCurrentIndex);
         updateSize();
+        if (oldTextSize > 0 && oldTextSize != textSize) {
+            float fromScale = mZoomAnimating ? mZoomScale : (float) oldTextSize / textSize;
+            startZoomAnimation(fromScale);
+        }
     }
 
     public void setTypeface(Typeface newTypeface) {
-        mRenderer = new TerminalRenderer(mRenderer.mTextSize, newTypeface);
+        setTypeface(newTypeface, newTypeface);
+    }
+
+    public void setTypeface(Typeface newTypeface, Typeface newBoldTypeface) {
+        mRenderer = new TerminalRenderer(mRenderer.mTextSize, newTypeface, newBoldTypeface);
+        mRenderer.setSearchHighlights(mSearchHighlights, mSearchCurrentIndex);
         updateSize();
         invalidate();
     }
@@ -589,10 +672,29 @@ public final class TerminalView extends View {
         }
     }
 
+    /** Scroll the viewport directly by a fractional number of rows (finger dragging). */
+    private void scrollByRows(float rows) {
+        if (mEmulator == null) return;
+
+        float minTopRow = -mEmulator.getScreen().getActiveTranscriptRows();
+        float newDisplayTopRow = mDisplayTopRow + rows;
+        if (newDisplayTopRow < minTopRow) newDisplayTopRow = minTopRow;
+        if (newDisplayTopRow > 0f) newDisplayTopRow = 0f;
+
+        mDisplayTopRow = newDisplayTopRow;
+        mTopRow = Math.round(mDisplayTopRow);
+        mEmulator.setTopRow(mTopRow);
+        mScrollAnimating = false;
+        notifyScrollListener();
+
+        if (!awakenScrollBars()) invalidate();
+    }
+
     /** Overriding {@link View#onGenericMotionEvent(MotionEvent)}. */
     @Override
     public boolean onGenericMotionEvent(MotionEvent event) {
         if (mEmulator != null && event.isFromSource(InputDevice.SOURCE_MOUSE) && event.getAction() == MotionEvent.ACTION_SCROLL) {
+            mLastUserInteractionTime = SystemClock.uptimeMillis();
             // Handle mouse wheel scrolling.
             boolean up = event.getAxisValue(MotionEvent.AXIS_VSCROLL) > 0.0f;
             doScroll(event, up ? -3 : 3);
@@ -605,6 +707,7 @@ public final class TerminalView extends View {
     @Override
     @TargetApi(23)
     public boolean onTouchEvent(MotionEvent event) {
+        mLastUserInteractionTime = SystemClock.uptimeMillis();
         if (mEmulator == null) return true;
         final int action = event.getAction();
 
@@ -798,6 +901,13 @@ public final class TerminalView extends View {
         if (event.isAltPressed() || leftAltDown) keyMod |= KeyHandler.KEYMOD_ALT;
         if (shiftDown) keyMod |= KeyHandler.KEYMOD_SHIFT;
         if (event.isNumLockOn()) keyMod |= KeyHandler.KEYMOD_NUM_LOCK;
+        if ((mEmulator.getKittyKeyboardFlags() & 2) != 0 && event.getRepeatCount() > 0) {
+            String repeatCode = KeyHandler.getKittyCode(keyCode, keyMod, 2, mEmulator.getKittyKeyboardFlags());
+            if (repeatCode != null) {
+                mTermSession.write(repeatCode);
+                return true;
+            }
+        }
         // https://github.com/termux/termux-app/issues/731
         if (!event.isFunctionPressed() && handleKeyCode(keyCode, keyMod)) {
             if (TERMINAL_VIEW_KEY_LOGGING_ENABLED) mClient.logInfo(LOG_TAG, "handleKeyCode() took key event");
@@ -861,6 +971,24 @@ public final class TerminalView extends View {
 
         if (mClient.onCodePoint(codePoint, controlDown, mTermSession)) return;
 
+        // Kitty keyboard protocol: encode modified (or, when requested, all) printable keys as
+        // CSI codepoint ; modifiers u.
+        if (mEmulator != null) {
+            int kittyFlags = mEmulator.getKittyKeyboardFlags();
+            if (kittyFlags != 0 && (controlDown || altDown || (kittyFlags & 8) != 0)) {
+                int modifier = 1;
+                if (controlDown) modifier += 4;
+                if (altDown) modifier += 2;
+                int keyCodePoint = codePoint;
+                if (Character.isUpperCase(codePoint)) {
+                    modifier += 1;
+                    keyCodePoint = Character.toLowerCase(codePoint);
+                }
+                mTermSession.write("\033[" + keyCodePoint + ";" + modifier + "u");
+                return;
+            }
+        }
+
         if (controlDown) {
             if (codePoint >= 'a' && codePoint <= 'z') {
                 codePoint = codePoint - 'a' + 1;
@@ -919,6 +1047,15 @@ public final class TerminalView extends View {
             return true;
 
         TerminalEmulator term = mTermSession.getEmulator();
+        int kittyFlags = term.getKittyKeyboardFlags();
+        if (kittyFlags != 0) {
+            String kittyCode = KeyHandler.getKittyCode(keyCode, keyMod, 1, kittyFlags);
+            if (kittyCode != null) {
+                mTermSession.write(kittyCode);
+                return true;
+            }
+        }
+
         String code = KeyHandler.getCode(keyCode, keyMod, term.isCursorKeysApplicationMode(), term.isKeypadApplicationMode());
         if (code == null) return false;
         mTermSession.write(code);
@@ -961,6 +1098,15 @@ public final class TerminalView extends View {
         // to exit the activity.
         if (mEmulator == null && keyCode != KeyEvent.KEYCODE_BACK) return true;
 
+        if (mEmulator != null && mTermSession != null && (mEmulator.getKittyKeyboardFlags() & 2) != 0) {
+            int keyMod = 0;
+            if (event.isCtrlPressed() || mClient.readControlKey()) keyMod |= KeyHandler.KEYMOD_CTRL;
+            if (event.isAltPressed() || mClient.readAltKey()) keyMod |= KeyHandler.KEYMOD_ALT;
+            if (event.isShiftPressed() || mClient.readShiftKey()) keyMod |= KeyHandler.KEYMOD_SHIFT;
+            String kittyCode = KeyHandler.getKittyCode(keyCode, keyMod, 3, mEmulator.getKittyKeyboardFlags());
+            if (kittyCode != null) mTermSession.write(kittyCode);
+        }
+
         if (mClient.onKeyUp(keyCode, event)) {
             invalidate();
             return true;
@@ -985,37 +1131,43 @@ public final class TerminalView extends View {
     public void updateSize() {
         int viewWidth = getWidth();
         int viewHeight = getHeight();
-        if (viewWidth == 0 || viewHeight == 0 || mTermSession == null) return;
+        if (viewWidth == 0 || viewHeight == 0 || mTermSession == null || mRenderer == null) return;
 
         // Set to 80 and 24 if you want to enable vttest.
         int newColumns = Math.max(4, (int) (viewWidth / mRenderer.mFontWidth));
         int newRows = Math.max(4, (viewHeight - mRenderer.mFontLineSpacingAndAscent) / mRenderer.mFontLineSpacing);
 
         if (mEmulator == null || (newColumns != mEmulator.mColumns || newRows != mEmulator.mRows)) {
-            mTermSession.updateSize(newColumns, newRows, (int) mRenderer.getFontWidth(), mRenderer.getFontLineSpacing());
-            mEmulator = mTermSession.getEmulator();
-            mClient.onEmulatorSet();
-
-            // Update mTerminalCursorBlinkerRunnable inner class mEmulator on session change
-            if (mTerminalCursorBlinkerRunnable != null)
-                mTerminalCursorBlinkerRunnable.setEmulator(mEmulator);
-
-            // Restore cached top row value if session/emulator was switched back from a
-            // different session or after activity restart. The top row value also needs to be
-            // maintained after opening/closing soft keyboard.
-            int topRow = 0;
-            if (mEmulator != null) {
-                int rowsInHistory = mEmulator.getScreen().getActiveTranscriptRows();
-                int cachedTopRow = mEmulator.getTopRow();
-                if (cachedTopRow >= -rowsInHistory) {
-                    topRow = cachedTopRow;
-                }
-            }
-            setTopRow(topRow);
-
-            scrollTo(0, 0);
-            invalidate();
+            applySize(newColumns, newRows);
         }
+    }
+
+    private void applySize(int newColumns, int newRows) {
+        if (mTermSession == null || mRenderer == null) return;
+
+        mTermSession.updateSize(newColumns, newRows, (int) mRenderer.getFontWidth(), mRenderer.getFontLineSpacing());
+        mEmulator = mTermSession.getEmulator();
+        mClient.onEmulatorSet();
+
+        // Update mTerminalCursorBlinkerRunnable inner class mEmulator on session change
+        if (mTerminalCursorBlinkerRunnable != null)
+            mTerminalCursorBlinkerRunnable.setEmulator(mEmulator);
+
+        // Restore cached top row value if session/emulator was switched back from a
+        // different session or after activity restart. The top row value also needs to be
+        // maintained after opening/closing soft keyboard.
+        int topRow = 0;
+        if (mEmulator != null) {
+            int rowsInHistory = mEmulator.getScreen().getActiveTranscriptRows();
+            int cachedTopRow = mEmulator.getTopRow();
+            if (cachedTopRow >= -rowsInHistory) {
+                topRow = cachedTopRow;
+            }
+        }
+        setTopRowImmediate(topRow);
+
+        scrollTo(0, 0);
+        invalidate();
     }
 
     @Override
@@ -1023,13 +1175,32 @@ public final class TerminalView extends View {
         if (mEmulator == null) {
             canvas.drawColor(0XFF000000);
         } else {
+            updateSmoothScroll();
+            updateZoom();
+
+            // Guard against the transcript being trimmed while an animation is still in flight.
+            int minTopRow = -mEmulator.getScreen().getActiveTranscriptRows();
+            if (mDisplayTopRow < minTopRow) mDisplayTopRow = minTopRow;
+            if (mTopRow < minTopRow) mTopRow = minTopRow;
+
             // render the terminal view and highlight any selected text
             int[] sel = mDefaultSelectors;
             if (mTextSelectionCursorController != null) {
                 mTextSelectionCursorController.getSelectors(sel);
             }
 
-            mRenderer.render(mEmulator, canvas, mTopRow, sel[0], sel[1], sel[2], sel[3]);
+            int topRow = (int) Math.floor(mDisplayTopRow);
+            float topRowOffset = mDisplayTopRow - topRow;
+            boolean transformed = mZoomScale != 1f;
+            if (transformed) {
+                canvas.save();
+                canvas.scale(mZoomScale, mZoomScale);
+            }
+            mRenderer.render(mEmulator, canvas, topRow, topRowOffset, sel[0], sel[1], sel[2], sel[3]);
+            if (transformed) {
+                canvas.restore();
+            }
+            if (mRenderer.isCursorAnimating() || mScrollAnimating || mZoomAnimating || mEmulator.getProgressState() == 3) postInvalidateOnAnimation();
 
             // render the text selection handles
             renderTextSelection();
@@ -1067,6 +1238,71 @@ public final class TerminalView extends View {
         return mTopRow;
     }
 
+    /** Run a scrollback search and highlight every match. Returns the number of matches. */
+    public int setSearchQuery(String query) {
+        mSearchQuery = query;
+        if (mEmulator == null || TextUtils.isEmpty(query)) {
+            mSearchHighlights = new ArrayList<>();
+            mSearchCurrentIndex = -1;
+        } else {
+            mSearchHighlights = mEmulator.getScreen().search(query);
+            mSearchCurrentIndex = mSearchHighlights.isEmpty() ? -1 : 0;
+        }
+        applySearchHighlights();
+        if (mSearchCurrentIndex >= 0) scrollToSearchHighlight();
+        return mSearchHighlights.size();
+    }
+
+    public int getSearchMatchCount() {
+        return mSearchHighlights.size();
+    }
+
+    public int getSearchCurrentMatch() {
+        return mSearchCurrentIndex;
+    }
+
+    /** Move to the next or previous search match, wrapping around. */
+    public boolean searchNext(boolean forward) {
+        if (mEmulator == null || TextUtils.isEmpty(mSearchQuery)) return false;
+        // Recompute so the matches follow any output that scrolled in the meantime.
+        mSearchHighlights = mEmulator.getScreen().search(mSearchQuery);
+        int count = mSearchHighlights.size();
+        if (count == 0) {
+            mSearchCurrentIndex = -1;
+            applySearchHighlights();
+            return false;
+        }
+        if (mSearchCurrentIndex < 0) {
+            mSearchCurrentIndex = 0;
+        } else {
+            mSearchCurrentIndex = (mSearchCurrentIndex + (forward ? 1 : -1) + count) % count;
+        }
+        applySearchHighlights();
+        scrollToSearchHighlight();
+        return true;
+    }
+
+    public void clearSearch() {
+        mSearchQuery = null;
+        mSearchHighlights = new ArrayList<>();
+        mSearchCurrentIndex = -1;
+        applySearchHighlights();
+    }
+
+    private void applySearchHighlights() {
+        if (mRenderer != null) mRenderer.setSearchHighlights(mSearchHighlights, mSearchCurrentIndex);
+        invalidate();
+    }
+
+    private void scrollToSearchHighlight() {
+        if (mSearchCurrentIndex < 0 || mSearchCurrentIndex >= mSearchHighlights.size()) return;
+        int matchRow = mSearchHighlights.get(mSearchCurrentIndex)[0];
+        int rowsInHistory = mEmulator.getScreen().getActiveTranscriptRows();
+        int target = matchRow - mEmulator.mRows / 2;
+        target = Math.max(-rowsInHistory, Math.min(target, 0));
+        setTopRow(target);
+    }
+
     public void setTopRow(int topRow) {
         setTopRow(topRow, true);
     }
@@ -1075,6 +1311,82 @@ public final class TerminalView extends View {
         mTopRow = topRow;
         if (updateEmulator && mEmulator != null) {
             mEmulator.setTopRow(mTopRow);
+        }
+        if (mDisplayTopRow != topRow) {
+            if (!mScrollAnimating) mScrollLastFrameTimeMs = SystemClock.uptimeMillis();
+            mScrollAnimating = true;
+            invalidate();
+        }
+        notifyScrollListener();
+    }
+
+    /** Jump to a top row without animating, used when the terminal content itself shifted. */
+    private void setTopRowImmediate(int topRow) {
+        mTopRow = topRow;
+        mDisplayTopRow = topRow;
+        mScrollAnimating = false;
+        if (mEmulator != null) {
+            mEmulator.setTopRow(topRow);
+        }
+        notifyScrollListener();
+        invalidate();
+    }
+
+    public void setScrollListener(ScrollListener listener) {
+        mScrollListener = listener;
+        notifyScrollListener();
+    }
+
+    private void notifyScrollListener() {
+        // Use the target row instead of the eased display row: the button should appear the moment
+        // the user scrolls away from the bottom and disappear the moment they jump back, without
+        // waiting for the smooth-scroll animation to settle.
+        if (mScrollListener != null) mScrollListener.onScrollChanged(mTopRow > -0.5f);
+    }
+
+    private void startZoomAnimation(float fromScale) {
+        mZoomScaleFrom = fromScale;
+        mZoomScaleTo = 1f;
+        mZoomScale = fromScale;
+        mZoomAnimStartTime = SystemClock.uptimeMillis();
+        mZoomAnimating = true;
+        invalidate();
+    }
+
+    /** Ease the zoom scale back to 1 after a font size change. */
+    private void updateZoom() {
+        if (!mZoomAnimating) return;
+
+        long now = SystemClock.uptimeMillis();
+        float progress = Math.min(1f, (now - mZoomAnimStartTime) / (float) ZOOM_ANIMATION_DURATION_MS);
+        float eased = 1f - (1f - progress) * (1f - progress) * (1f - progress);
+        mZoomScale = mZoomScaleFrom + (mZoomScaleTo - mZoomScaleFrom) * eased;
+
+        if (progress >= 1f) {
+            mZoomAnimating = false;
+            mZoomScale = 1f;
+        }
+    }
+
+    /** Ease the rendered scroll position towards the target for smooth scrolling. */
+    private void updateSmoothScroll() {
+        long now = SystemClock.uptimeMillis();
+        float dt = Math.min((now - mScrollLastFrameTimeMs) / 1000f, 1f / 30f);
+        mScrollLastFrameTimeMs = now;
+        if (!mScrollAnimating) return;
+
+        float delta = mTopRow - mDisplayTopRow;
+        if (Math.abs(delta) < 0.002f) {
+            mDisplayTopRow = mTopRow;
+            mScrollAnimating = false;
+            return;
+        }
+
+        float factor = 1f - (float) Math.exp(-dt * 22f);
+        mDisplayTopRow += delta * factor;
+        if (Math.abs(mTopRow - mDisplayTopRow) < 0.002f) {
+            mDisplayTopRow = mTopRow;
+            mScrollAnimating = false;
         }
     }
 

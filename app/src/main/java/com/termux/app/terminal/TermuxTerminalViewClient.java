@@ -7,12 +7,16 @@ import android.content.ClipboardManager;
 import android.content.Context;
 import android.media.AudioManager;
 import android.os.Environment;
+import android.os.Handler;
+import android.os.Looper;
 import android.text.TextUtils;
 import android.view.Gravity;
+import android.view.HapticFeedbackConstants;
 import android.view.InputDevice;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.View;
+import android.view.ViewConfiguration;
 import android.widget.EditText;
 import android.widget.ListView;
 import android.widget.Toast;
@@ -61,6 +65,22 @@ public class TermuxTerminalViewClient extends TermuxTerminalViewClientBase {
 
     /** Keeping track of the special keys acting as Ctrl and Fn for the soft keyboard and other hardware keys. */
     boolean mVirtualControlKeyDown, mVirtualFnKeyDown;
+
+    /**
+     * Volume down acts as Ctrl only after a long press. A short press toggles the soft keyboard.
+     */
+    private Handler mVolumeDownHandler;
+    private boolean mVolumeDownLongPressTriggered;
+    private final Runnable mVolumeDownLongPressRunnable = new Runnable() {
+        @Override
+        public void run() {
+            mVirtualControlKeyDown = true;
+            mVolumeDownLongPressTriggered = true;
+            if (mActivity.getTerminalView() != null) {
+                mActivity.getTerminalView().performHapticFeedback(HapticFeedbackConstants.LONG_PRESS);
+            }
+        }
+    };
 
     private Runnable mShowSoftKeyboardRunnable;
 
@@ -131,6 +151,13 @@ public class TermuxTerminalViewClient extends TermuxTerminalViewClientBase {
     public void onStop() {
         // Stop terminal cursor blinking if enabled
         setTerminalCursorBlinkerState(false);
+
+        // Cancel a pending volume-down long-press so it cannot fire while in background
+        if (mVolumeDownHandler != null) {
+            mVolumeDownHandler.removeCallbacks(mVolumeDownLongPressRunnable);
+        }
+        mVolumeDownLongPressTriggered = false;
+        mVirtualControlKeyDown = false;
     }
 
     /**
@@ -185,9 +212,16 @@ public class TermuxTerminalViewClient extends TermuxTerminalViewClientBase {
     @Override
     public void onSingleTapUp(MotionEvent e) {
         TerminalEmulator term = mActivity.getCurrentSession().getEmulator();
+        int[] columnAndRow = mActivity.getTerminalView().getColumnAndRow(e, true);
+
+        // OSC 8 hyperlinks win over guessing a URL from the text under the finger.
+        String hyperlink = term.getHyperlinkUriAt(columnAndRow[1], columnAndRow[0]);
+        if (hyperlink != null && !hyperlink.isEmpty()) {
+            ShareUtils.openUrl(mActivity, hyperlink);
+            return;
+        }
 
         if (mActivity.getProperties().shouldOpenTerminalTranscriptURLOnClick()) {
-            int[] columnAndRow = mActivity.getTerminalView().getColumnAndRow(e, true);
             String wordAtTap = term.getScreen().getWordAtLocation(columnAndRow[0], columnAndRow[1]);
             LinkedHashSet<CharSequence> urlSet = TermuxUrlUtils.extractUrls(wordAtTap);
 
@@ -300,6 +334,13 @@ public class TermuxTerminalViewClient extends TermuxTerminalViewClientBase {
         return handleVirtualKeys(keyCode, e, false);
     }
 
+    private Handler getVolumeDownHandler() {
+        if (mVolumeDownHandler == null) {
+            mVolumeDownHandler = new Handler(Looper.getMainLooper());
+        }
+        return mVolumeDownHandler;
+    }
+
     /** Handle dedicated volume buttons as virtual keys if applicable. */
     private boolean handleVirtualKeys(int keyCode, KeyEvent event, boolean down) {
         InputDevice inputDevice = event.getDevice();
@@ -309,10 +350,35 @@ public class TermuxTerminalViewClient extends TermuxTerminalViewClientBase {
             // Do not steal dedicated buttons from a full external keyboard.
             return false;
         } else if (keyCode == KeyEvent.KEYCODE_VOLUME_DOWN) {
-            mVirtualControlKeyDown = down;
+            Handler handler = getVolumeDownHandler();
+            if (down) {
+                if (event.getRepeatCount() == 0) {
+                    mVirtualControlKeyDown = false;
+                    mVolumeDownLongPressTriggered = false;
+                    handler.postDelayed(mVolumeDownLongPressRunnable, ViewConfiguration.getLongPressTimeout());
+                }
+            } else {
+                handler.removeCallbacks(mVolumeDownLongPressRunnable);
+                boolean longPressed = mVolumeDownLongPressTriggered;
+                mVolumeDownLongPressTriggered = false;
+                mVirtualControlKeyDown = false;
+                if (!longPressed) {
+                    // Short press: summon/toggle the soft keyboard.
+                    onToggleSoftKeyboardRequest();
+                }
+            }
             return true;
         } else if (keyCode == KeyEvent.KEYCODE_VOLUME_UP) {
-            mVirtualFnKeyDown = down;
+            // Volume up toggles the sessions drawer instead of acting as a virtual Fn key.
+            if (down && event.getRepeatCount() == 0) {
+                DrawerLayout drawer = mActivity.getDrawer();
+                if (drawer.getDrawerLockMode(Gravity.LEFT) != DrawerLayout.LOCK_MODE_LOCKED_CLOSED) {
+                    if (drawer.isDrawerOpen(Gravity.LEFT))
+                        drawer.closeDrawer(Gravity.LEFT);
+                    else
+                        drawer.openDrawer(Gravity.LEFT);
+                }
+            }
             return true;
         }
         return false;
@@ -359,6 +425,16 @@ public class TermuxTerminalViewClient extends TermuxTerminalViewClientBase {
 
     @Override
     public boolean onCodePoint(final int codePoint, boolean ctrlDown, TerminalSession session) {
+        // A soft keyboard sends Enter as committed text, which arrives here as Ctrl+M (109) or
+        // Ctrl+J (106), not as KEYCODE_ENTER. On a finished session that must still mean "press
+        // Enter to close", like the hardware Enter handled in onKeyDown().
+        if (!session.isRunning() && (codePoint == '\r' || codePoint == '\n'
+            || (ctrlDown && (codePoint == 'm' || codePoint == 'M'
+                || codePoint == 'j' || codePoint == 'J')))) {
+            mTermuxTerminalSessionActivityClient.removeFinishedSession(session);
+            return true;
+        }
+
         if (mVirtualFnKeyDown) {
             int resultingKeyCode = -1;
             int resultingCodePoint = -1;
@@ -699,7 +775,8 @@ public class TermuxTerminalViewClient extends TermuxTerminalViewClientBase {
 
         LinkedHashSet<CharSequence> urlSet = TermuxUrlUtils.extractUrls(text);
         if (urlSet.isEmpty()) {
-            new AlertDialog.Builder(mActivity).setMessage(R.string.title_select_url_none_found).show();
+            ViewUtils.applyOverrideTypeface(new AlertDialog.Builder(mActivity)
+                .setMessage(R.string.title_select_url_none_found).show());
             return;
         }
 
@@ -724,6 +801,7 @@ public class TermuxTerminalViewClient extends TermuxTerminalViewClientBase {
         });
 
         dialog.show();
+        ViewUtils.applyOverrideTypeface(dialog);
     }
 
     public void reportIssueFromTranscript() {

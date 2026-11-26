@@ -11,6 +11,7 @@ import androidx.viewpager.widget.ViewPager;
 
 import com.termux.R;
 import com.termux.app.TermuxActivity;
+import com.termux.app.terminal.AppTypeface;
 import com.termux.shared.termux.extrakeys.ExtraKeysView;
 import com.termux.terminal.TerminalSession;
 
@@ -49,6 +50,7 @@ public class TerminalToolbarViewPager {
                 mActivity.setExtraKeysView(extraKeysView);
                 extraKeysView.reload(mActivity.getTermuxTerminalExtraKeys().getExtraKeysInfo(),
                     mActivity.getTerminalToolbarDefaultHeight());
+                AppTypeface.applyToViewTree(extraKeysView);
 
                 // apply extra keys fix if enabled in prefs
                 if (mActivity.getProperties().isUsingFullScreen() && mActivity.getProperties().isUsingFullScreenWorkAround()) {
@@ -57,6 +59,7 @@ public class TerminalToolbarViewPager {
 
             } else {
                 layout = inflater.inflate(R.layout.view_terminal_toolbar_text_input, collection, false);
+                AppTypeface.applyToViewTree(layout);
                 final EditText editText = layout.findViewById(R.id.terminal_toolbar_text_input);
 
                 if (mSavedTextInput != null) {

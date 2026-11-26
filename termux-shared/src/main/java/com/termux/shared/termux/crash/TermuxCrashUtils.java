@@ -161,7 +161,12 @@ public class TermuxCrashUtils implements CrashHandler.CrashHandlerClient {
         new Thread() {
             @Override
             public void run() {
-                notifyAppCrashFromCrashLogFileInner(context, logTagParam);
+                try {
+                    notifyAppCrashFromCrashLogFileInner(context, logTagParam);
+                } catch (Throwable t) {
+                    // Never let the crash notifier itself crash the app.
+                    Logger.logStackTraceWithMessage(LOG_TAG, "Failed to notify app crash from crash log file", t);
+                }
             }
         }.start();
     }
@@ -356,15 +361,22 @@ public class TermuxCrashUtils implements CrashHandler.CrashHandlerClient {
         //CharSequence notificationTextCharSequence = notificationTextString;
 
         // Build the notification
-        Notification.Builder builder = getCrashReportsNotificationBuilder(currentPackageContext, termuxPackageContext,
+        // The notification is always posted with the Termux package context/notification manager, so
+        // use it for the builder icon as well. Using a plugin package resource here can throw a
+        // SecurityException when the plugin does not share the Termux UID.
+        Notification.Builder builder = getCrashReportsNotificationBuilder(termuxPackageContext, termuxPackageContext,
             title, notificationTextCharSequence, notificationTextCharSequence, contentIntent, deleteIntent,
             NotificationUtils.NOTIFICATION_MODE_VIBRATE);
         if (builder == null) return;
 
         // Send the notification
-        NotificationManager notificationManager = NotificationUtils.getNotificationManager(termuxPackageContext);
-        if (notificationManager != null)
-            notificationManager.notify(nextNotificationId, builder.build());
+        try {
+            NotificationManager notificationManager = NotificationUtils.getNotificationManager(termuxPackageContext);
+            if (notificationManager != null)
+                notificationManager.notify(nextNotificationId, builder.build());
+        } catch (Throwable t) {
+            Logger.logStackTraceWithMessage(LOG_TAG, "Failed to send crash report notification", t);
+        }
     }
 
     /**

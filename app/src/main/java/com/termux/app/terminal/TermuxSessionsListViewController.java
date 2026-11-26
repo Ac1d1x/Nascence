@@ -1,6 +1,7 @@
 package com.termux.app.terminal;
 
 import android.annotation.SuppressLint;
+import android.content.res.ColorStateList;
 import android.graphics.Color;
 import android.graphics.Paint;
 import android.graphics.Typeface;
@@ -13,6 +14,7 @@ import android.view.View;
 import android.view.ViewGroup;
 import android.widget.AdapterView;
 import android.widget.ArrayAdapter;
+import android.widget.ImageButton;
 import android.widget.TextView;
 
 import androidx.annotation.NonNull;
@@ -50,6 +52,7 @@ public class TermuxSessionsListViewController extends ArrayAdapter<TermuxSession
         }
 
         TextView sessionTitleView = sessionRowView.findViewById(R.id.session_title);
+        AppTypeface.applyToViewTree(sessionTitleView);
 
         TerminalSession sessionAtRow = getItem(position).getTerminalSession();
         if (sessionAtRow == null) {
@@ -59,10 +62,16 @@ public class TermuxSessionsListViewController extends ArrayAdapter<TermuxSession
 
         boolean shouldEnableDarkTheme = ThemeUtils.shouldEnableDarkTheme(mActivity, NightMode.getAppNightMode().getName());
 
-        if (shouldEnableDarkTheme) {
-            sessionTitleView.setBackground(
-                ContextCompat.getDrawable(mActivity, R.drawable.session_background_black_selected)
-            );
+        sessionRowView.setBackground(ContextCompat.getDrawable(mActivity,
+            shouldEnableDarkTheme ? R.drawable.session_background_black_selected
+                : R.drawable.session_background_selected));
+
+        ImageButton closeButton = sessionRowView.findViewById(R.id.session_close);
+        if (closeButton != null) {
+            closeButton.setImageTintList(ColorStateList.valueOf(
+                shouldEnableDarkTheme ? Color.WHITE : Color.BLACK));
+            closeButton.setOnClickListener(v ->
+                mActivity.getTermuxTerminalSessionClient().closeSession(sessionAtRow));
         }
 
         String name = sessionAtRow.mSessionName;
@@ -95,7 +104,14 @@ public class TermuxSessionsListViewController extends ArrayAdapter<TermuxSession
     @Override
     public void onItemClick(AdapterView<?> parent, View view, int position, long id) {
         TermuxSession clickedSession = getItem(position);
-        mActivity.getTermuxTerminalSessionClient().setCurrentSession(clickedSession.getTerminalSession());
+        TerminalSession session = clickedSession.getTerminalSession();
+        com.termux.app.TermuxService service = mActivity.getTermuxService();
+        if (service != null && service.releaseOverlaySession(session)) {
+            // The floating terminal just released this session; give it to the activity's client so
+            // this view receives its screen updates from now on.
+            session.updateTerminalSessionClient(mActivity.getTermuxTerminalSessionClient());
+        }
+        mActivity.getTermuxTerminalSessionClient().setCurrentSession(session);
         mActivity.getDrawer().closeDrawers();
     }
 

@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/overlay_root"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@drawable/overlay_terminal_background"
+    android:clipChildren="true"
+    android:clipToOutline="true">
+
+    <!-- Terminal content, anchored to the top of the sheet. Its height is the expanded sheet
+         height minus the grab handle, and it keeps that size while the sheet is collapsed so the
+         PTY is not resized on every animation frame. The padding keeps the glyphs away from the
+         panel edges and the rounded corners. -->
+    <FrameLayout
+        android:id="@+id/overlay_sheet_content"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_gravity="top"
+        android:paddingStart="10dp"
+        android:paddingEnd="10dp"
+        android:paddingTop="10dp"
+        android:paddingBottom="6dp">
+
+        <com.termux.view.TerminalView
+            android:id="@+id/overlay_terminal_view"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:focusable="true"
+            android:focusableInTouchMode="true"
+            android:scrollbars="vertical" />
+
+    </FrameLayout>
+
+    <!-- Grab handle pinned to the free (bottom) edge, like a bottom sheet's handle mirrored to the
+         top of the screen. Dragging it up collapses the sheet, dragging it down expands it. -->
+    <FrameLayout
+        android:id="@+id/overlay_drag_handle"
+        android:layout_width="match_parent"
+        android:layout_height="28dp"
+        android:layout_gravity="bottom"
+        android:contentDescription="@string/overlay_resize">
+
+        <View
+            android:id="@+id/overlay_grip"
+            android:layout_width="44dp"
+            android:layout_height="4dp"
+            android:layout_gravity="center"
+            android:background="@drawable/overlay_grip_background" />
+
+    </FrameLayout>
+
+</FrameLayout>

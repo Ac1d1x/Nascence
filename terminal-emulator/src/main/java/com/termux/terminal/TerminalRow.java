@@ -47,6 +47,11 @@ public final class TerminalRow {
     boolean mLineWrap;
     /** The style bits of each cell in the row. See {@link TextStyle}. */
     final long[] mStyle;
+    /**
+     * Extended per-cell style bits, allocated lazily. Only rows that actually use an explicit
+     * underline color or a hyperlink pay for this extra array.
+     */
+    private long[] mExtraStyle;
     /** If this row might contain chars with width != 1, used for deactivating fast path */
     boolean mHasNonOneWidthOrSurrogateChars;
     /** If this row has a {@link TerminalBitmap}. Used for performance only. */
@@ -82,7 +87,7 @@ public final class TerminalRow {
                 sourceX1 += latestNonCombiningWidth;
                 latestNonCombiningWidth = w;
             }
-            setChar(destinationX, codePoint, line.getStyle(sourceX1));
+            setChar(destinationX, codePoint, line.getStyle(sourceX1), line.getExtraStyle(sourceX1));
         }
     }
 
@@ -146,17 +151,36 @@ public final class TerminalRow {
     public void clear(long style) {
         Arrays.fill(mText, ' ');
         Arrays.fill(mStyle, style);
+        if (mExtraStyle != null) Arrays.fill(mExtraStyle, 0);
         mSpaceUsed = mColumns;
         mHasNonOneWidthOrSurrogateChars = false;
         mHasTerminalBitmap = false;
     }
 
+    private void setExtraStyle(int column, long extra) {
+        if (extra == 0) {
+            if (mExtraStyle != null) mExtraStyle[column] = 0;
+            return;
+        }
+        if (mExtraStyle == null) mExtraStyle = new long[mColumns];
+        mExtraStyle[column] = extra;
+    }
+
+    public long getExtraStyle(int column) {
+        return mExtraStyle == null ? 0 : mExtraStyle[column];
+    }
+
     // https://github.com/steven676/Android-Terminal-Emulator/commit/9a47042620bec87617f0b4f5d50568535668fe26
     public void setChar(int columnToSet, int codePoint, long style) {
+        setChar(columnToSet, codePoint, style, 0);
+    }
+
+    public void setChar(int columnToSet, int codePoint, long style, long extraStyle) {
         if (columnToSet  < 0 || columnToSet >= mStyle.length)
             throw new IllegalArgumentException("TerminalRow.setChar(): columnToSet=" + columnToSet + ", codePoint=" + codePoint + ", style=" + style);
 
         mStyle[columnToSet] = style;
+        setExtraStyle(columnToSet, extraStyle);
 
         if (!mHasTerminalBitmap && TextStyle.isTerminalBitmap(style)) {
             mHasTerminalBitmap = true;
@@ -183,10 +207,10 @@ public final class TerminalRow {
             if (wasExtraColForWideChar) columnToSet--;
         } else {
             // Check if we are overwriting the second half of a wide character starting at the previous column:
-            if (wasExtraColForWideChar) setChar(columnToSet - 1, ' ', style);
+            if (wasExtraColForWideChar) setChar(columnToSet - 1, ' ', style, extraStyle);
             // Check if we are overwriting the first half of a wide character starting at the next column:
             boolean overwritingWideCharInNextColumn = newCodePointDisplayWidth == 2 && wideDisplayCharacterStartingAt(columnToSet + 1);
-            if (overwritingWideCharInNextColumn) setChar(columnToSet + 1, ' ', style);
+            if (overwritingWideCharInNextColumn) setChar(columnToSet + 1, ' ', style, extraStyle);
         }
 
         char[] text = mText;
@@ -285,6 +309,27 @@ public final class TerminalRow {
 
     public final long getStyle(int column) {
         return mStyle[column];
+    }
+
+    /** The visible text of this row, without the trailing blank cells. */
+    public String getText() {
+        int end = mSpaceUsed;
+        while (end > 0 && mText[end - 1] == ' ') end--;
+        return new String(mText, 0, end);
+    }
+
+    /** Map a java char index in {@link #mText} to a display column. */
+    public int getColumnForCharIndex(int charIndex) {
+        int column = 0;
+        for (int i = 0; i < charIndex && i < mSpaceUsed; ) {
+            char c = mText[i];
+            boolean highSurrogate = Character.isHighSurrogate(c);
+            int codePoint = highSurrogate ? Character.toCodePoint(c, mText[i + 1]) : c;
+            int width = WcWidth.width(codePoint);
+            if (width > 0) column += width;
+            i += highSurrogate ? 2 : 1;
+        }
+        return column;
     }
 
 }

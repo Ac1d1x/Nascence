@@ -7,14 +7,19 @@ import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.pm.PackageManager;
-import android.graphics.Typeface;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
+import android.graphics.ImageDecoder;
+import android.os.Build;
 import android.media.AudioAttributes;
 import android.media.SoundPool;
 import android.text.TextUtils;
+import android.view.View;
 import android.widget.ListView;
 
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
+import androidx.annotation.RequiresApi;
 
 import com.termux.R;
 import com.termux.shared.interact.ShareUtils;
@@ -27,6 +32,7 @@ import com.termux.app.TermuxService;
 import com.termux.shared.termux.settings.properties.TermuxPropertyConstants;
 import com.termux.shared.termux.terminal.io.BellHandler;
 import com.termux.shared.logger.Logger;
+import com.termux.shared.view.ViewUtils;
 import com.termux.terminal.TerminalColors;
 import com.termux.terminal.TerminalSession;
 import com.termux.terminal.TerminalSessionClient;
@@ -35,6 +41,7 @@ import com.termux.terminal.TextStyle;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.InputStream;
+import java.util.Locale;
 import java.util.Properties;
 
 /** The {@link TerminalSessionClient} implementation that may require an {@link Activity} for its interface methods. */
@@ -44,9 +51,17 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
 
     private static final int MAX_SESSIONS = 8;
 
+    /** Sessions killed from the drawer's close button, removed when their exit callback arrives. */
+    private final java.util.Set<TerminalSession> mSessionsPendingClose =
+        java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>());
+
     private SoundPool mBellSoundPool;
 
     private int mBellSoundId;
+
+    private WallpaperDrawable mWallpaperDrawable;
+    private File mWallpaperFile;
+    private long mWallpaperLastModified;
 
     private static final String LOG_TAG = "TermuxTerminalSessionActivityClient";
 
@@ -87,6 +102,10 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
         // the first time bell key is pressed and play() is called, since sound may not be loaded
         // quickly enough before the call to play(). https://stackoverflow.com/questions/35435625
         loadBellSoundPool();
+
+        // Pick up a wallpaper added or replaced while the app was in the background.
+        loadWallpaper();
+        updateBackgroundColor();
     }
 
     /**
@@ -137,6 +156,12 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
 
     @Override
     public void onSessionFinished(@NonNull TerminalSession finishedSession) {
+        if (mSessionsPendingClose.remove(finishedSession)) {
+            // The user closed this session from the drawer; remove it regardless of exit code.
+            removeFinishedSession(finishedSession);
+            return;
+        }
+
         TermuxService service = mActivity.getTermuxService();
 
         if (service == null || service.wantsToStop()) {
@@ -235,6 +260,23 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
     }
 
     @Override
+    public void onTerminalNotification(@Nullable String title, @NonNull String body) {
+        if (Build.VERSION.SDK_INT >= 33
+            && mActivity.checkSelfPermission("android.permission.POST_NOTIFICATIONS")
+                != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            mActivity.requestPermissions(new String[]{"android.permission.POST_NOTIFICATIONS"}, 1001);
+        }
+        TerminalNotificationHelper.notify(mActivity, title, body);
+    }
+
+    @Override
+    public void onTerminalProgress(int state, int progress) {
+        // The terminal view reads the progress state straight from the emulator, so only a redraw
+        // is needed here.
+        mActivity.getTerminalView().invalidate();
+    }
+
+    @Override
     public void setTerminalShellPid(@NonNull TerminalSession terminalSession, int pid) {
         TermuxService service = mActivity.getTermuxService();
         if (service == null) return;
@@ -297,11 +339,35 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
             // notify about switched session if not already displaying the session
             notifyOfSessionChange();
         }
+        if (session.getEmulator() != null)
+            TerminalThemeLibrary.applySelectedTheme(mActivity, session.getEmulator().mColors);
 
         // We call the following even when the session is already being displayed since config may
         // be stale, like current session not selected or scrolled to.
         checkAndScrollToSession(session);
         updateBackgroundColor();
+    }
+
+    /**
+     * Detaches the activity's terminal view from a session that the floating terminal is taking
+     * back. Switches to another running session when possible so the activity does not end up on a
+     * blank terminal.
+     */
+    public void detachSession(TerminalSession session) {
+        if (session == null) return;
+        if (mActivity.getCurrentSession() != session) return;
+
+        mActivity.getTerminalView().attachSession(null);
+
+        TermuxService service = mActivity.getTermuxService();
+        if (service == null) return;
+        for (TermuxSession candidate : service.getTermuxSessions()) {
+            TerminalSession other = candidate.getTerminalSession();
+            if (other != null && other != session && other.isRunning()) {
+                setCurrentSession(other);
+                return;
+            }
+        }
     }
 
     void notifyOfSessionChange() {
@@ -366,8 +432,9 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
         if (service == null) return;
 
         if (service.getTermuxSessionsSize() >= MAX_SESSIONS) {
-            new AlertDialog.Builder(mActivity).setTitle(R.string.title_max_terminals_reached).setMessage(R.string.msg_max_terminals_reached)
-                .setPositiveButton(android.R.string.ok, null).show();
+            ViewUtils.applyOverrideTypeface(new AlertDialog.Builder(mActivity)
+                .setTitle(R.string.title_max_terminals_reached).setMessage(R.string.msg_max_terminals_reached)
+                .setPositiveButton(android.R.string.ok, null).show());
         } else {
             TerminalSession currentSession = mActivity.getCurrentSession();
 
@@ -442,12 +509,32 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
             // There are no sessions to show, so finish the activity.
             mActivity.finishActivityIfNotFinishing();
         } else {
-            if (index >= size) {
+            if (index < 0 || index >= size) {
                 index = size - 1;
             }
             TermuxSession termuxSession = service.getTermuxSession(index);
             if (termuxSession != null)
                 setCurrentSession(termuxSession.getTerminalSession());
+        }
+    }
+
+    /** Closes a session from the drawer's close button, running or finished. */
+    public void closeSession(TerminalSession session) {
+        if (session == null) return;
+        TermuxService service = mActivity.getTermuxService();
+        if (service == null) return;
+
+        if (session.isRunning()) {
+            if (service.isOverlaySession(session)) {
+                // The floating terminal's client cleans up when its session exits.
+                session.finishIfRunning();
+                return;
+            }
+            // Kill it now; removal and switching happen when the exit callback arrives.
+            mSessionsPendingClose.add(session);
+            session.finishIfRunning();
+        } else {
+            removeFinishedSession(session);
         }
     }
 
@@ -507,11 +594,17 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
             TerminalSession session = mActivity.getCurrentSession();
             if (session != null && session.getEmulator() != null) {
                 session.getEmulator().mColors.reset();
+                TerminalThemeLibrary.applySelectedTheme(mActivity, session.getEmulator().mColors);
             }
+            loadWallpaper();
             updateBackgroundColor();
 
-            final Typeface newTypeface = (fontFile.exists() && fontFile.length() > 0) ? Typeface.createFromFile(fontFile) : Typeface.MONOSPACE;
-            mActivity.getTerminalView().setTypeface(newTypeface);
+            // The same typeface is used by the terminal and the app UI, following
+            // ~/.termux/font.ttf when the user provided one.
+            AppTypeface.reload(mActivity);
+            mActivity.getTerminalView().setTypeface(
+                AppTypeface.getRegular(mActivity), AppTypeface.getBold(mActivity));
+            AppTypeface.applyToViewTree(mActivity.getWindow().getDecorView());
         } catch (Exception e) {
             Logger.logStackTraceWithMessage(LOG_TAG, "Error in checkForFontAndColors()", e);
         }
@@ -519,9 +612,147 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
 
     public void updateBackgroundColor() {
         if (!mActivity.isVisible()) return;
+
+        View rootView = mActivity.findViewById(R.id.activity_termux_root_view);
+        if (mWallpaperDrawable != null) {
+            // Paint the content root rather than the decor so the terminal, toolbar and drawer all
+            // show the wallpaper above the window background.
+            if (rootView != null) {
+                rootView.setBackground(mWallpaperDrawable);
+            } else {
+                mActivity.getWindow().getDecorView().setBackground(mWallpaperDrawable);
+            }
+        } else if (rootView != null) {
+            rootView.setBackground(null);
+        }
+
         TerminalSession session = mActivity.getCurrentSession();
         if (session != null && session.getEmulator() != null) {
             mActivity.getWindow().getDecorView().setBackgroundColor(session.getEmulator().mColors.mCurrentColors[TextStyle.COLOR_INDEX_BACKGROUND]);
+        }
+    }
+
+    /**
+     * Load a custom wallpaper from {@code ~/.termux/background.png} (or .jpg/.jpeg/.webp, or a file
+     * named {@code background} without an extension). It is center-cropped behind the terminal.
+     */
+    private void loadWallpaper() {
+        File wallpaperFile = findWallpaperFile();
+
+        if (wallpaperFile == null) {
+            if (mWallpaperFile != null) {
+                Logger.logDebug(LOG_TAG, "Wallpaper file removed");
+            }
+            mWallpaperDrawable = null;
+            mWallpaperFile = null;
+            mWallpaperLastModified = 0;
+            return;
+        }
+
+        long lastModified = wallpaperFile.lastModified();
+        if (wallpaperFile.equals(mWallpaperFile) && lastModified == mWallpaperLastModified && mWallpaperDrawable != null) {
+            return;
+        }
+
+        Bitmap bitmap = decodeWallpaper(wallpaperFile);
+        if (bitmap == null) {
+            Logger.logError(LOG_TAG, "Failed to decode wallpaper: " + wallpaperFile.getAbsolutePath());
+            mWallpaperDrawable = null;
+            mWallpaperFile = null;
+            mWallpaperLastModified = 0;
+            return;
+        }
+
+        Logger.logDebug(LOG_TAG, "Loaded wallpaper " + wallpaperFile.getAbsolutePath()
+            + " (" + bitmap.getWidth() + "x" + bitmap.getHeight() + ")");
+        mWallpaperDrawable = new WallpaperDrawable(bitmap);
+        mWallpaperFile = wallpaperFile;
+        mWallpaperLastModified = lastModified;
+    }
+
+    private File findWallpaperFile() {
+        File wallpaperDirectory = TermuxConstants.TERMUX_FONT_FILE.getParentFile();
+        if (wallpaperDirectory == null) return null;
+
+        String[] baseNames = {"background", "wallpaper"};
+        String[] extensions = {".png", ".jpg", ".jpeg", ".webp", ""};
+        for (String baseName : baseNames) {
+            for (String extension : extensions) {
+                File candidate = new File(wallpaperDirectory, baseName + extension);
+                if (candidate.isFile() && candidate.length() > 0) return candidate;
+            }
+        }
+
+        File[] files = wallpaperDirectory.listFiles();
+        if (files == null) return null;
+        for (File candidate : files) {
+            if (!candidate.isFile() || candidate.length() == 0) continue;
+            String name = candidate.getName().toLowerCase(Locale.ROOT);
+            if (!name.startsWith("background") && !name.startsWith("wallpaper")) continue;
+            if (name.contains(".") && !name.endsWith(".png") && !name.endsWith(".jpg")
+                && !name.endsWith(".jpeg") && !name.endsWith(".webp")) continue;
+            return candidate;
+        }
+        return null;
+    }
+
+    private Bitmap decodeWallpaper(File file) {
+        String path = file.getAbsolutePath();
+
+        BitmapFactory.Options bounds = new BitmapFactory.Options();
+        bounds.inJustDecodeBounds = true;
+        try {
+            BitmapFactory.decodeFile(path, bounds);
+        } catch (Throwable t) {
+            Logger.logStackTraceWithMessage(LOG_TAG, "Failed to read wallpaper bounds: " + path, t);
+            return null;
+        }
+
+        Logger.logDebug(LOG_TAG, "Wallpaper " + path + " size=" + file.length()
+            + " readable=" + file.canRead() + " image=" + bounds.outWidth + "x" + bounds.outHeight
+            + " mime=" + bounds.outMimeType);
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null;
+
+        int targetWidth = mActivity.getResources().getDisplayMetrics().widthPixels;
+        int targetHeight = mActivity.getResources().getDisplayMetrics().heightPixels;
+        int sampleSize = 1;
+        while (bounds.outWidth / sampleSize > targetWidth * 2
+            || bounds.outHeight / sampleSize > targetHeight * 2) {
+            sampleSize *= 2;
+        }
+
+        BitmapFactory.Options options = new BitmapFactory.Options();
+        options.inSampleSize = sampleSize;
+        options.inPreferredConfig = Bitmap.Config.RGB_565;
+        options.inDither = true;
+
+        Bitmap bitmap = null;
+        try {
+            bitmap = BitmapFactory.decodeFile(path, options);
+        } catch (Throwable t) {
+            Logger.logStackTraceWithMessage(LOG_TAG, "BitmapFactory failed to decode wallpaper: " + path, t);
+        }
+
+        if (bitmap == null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            bitmap = decodeWallpaperWithImageDecoder(file, sampleSize);
+        }
+        if (bitmap == null) {
+            Logger.logError(LOG_TAG, "Could not decode wallpaper: " + path);
+        }
+        return bitmap;
+    }
+
+    @RequiresApi(Build.VERSION_CODES.P)
+    private Bitmap decodeWallpaperWithImageDecoder(File file, int sampleSize) {
+        try {
+            ImageDecoder.Source source = ImageDecoder.createSource(file);
+            return ImageDecoder.decodeBitmap(source, (decoder, info, src) -> {
+                decoder.setTargetSampleSize(sampleSize);
+                decoder.setAllocator(ImageDecoder.ALLOCATOR_SOFTWARE);
+            });
+        } catch (Throwable t) {
+            Logger.logStackTraceWithMessage(LOG_TAG, "ImageDecoder failed to decode wallpaper: " + file, t);
+            return null;
         }
     }
 

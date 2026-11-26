@@ -153,6 +153,94 @@ public final class KeyHandler {
         return getCode(keyCode, keyMod, cursorKeysApplication, keypadApplication);
     }
 
+    /** Functional key codes defined by the kitty keyboard protocol. */
+    public static String getKittyCode(int keyCode, int keyMode) {
+        return getKittyCode(keyCode, keyMode, 1, 0);
+    }
+
+    /** @param eventType 1 = press, 2 = repeat, 3 = release. */
+    public static String getKittyCode(int keyCode, int keyMode, int eventType) {
+        return getKittyCode(keyCode, keyMode, eventType, 0);
+    }
+
+    /**
+     * @param eventType 1 = press, 2 = repeat, 3 = release.
+     * @param flags the kitty progressive enhancement flags currently active.
+     */
+    public static String getKittyCode(int keyCode, int keyMode, int eventType, int flags) {
+        // Enter, Tab and Backspace must stay in their legacy form unless the application
+        // explicitly asked for all keys to be reported as escape codes. This is what keeps a
+        // shell usable after a program that enabled the protocol crashes without resetting it.
+        switch (keyCode) {
+            case KEYCODE_ENTER: return (flags & 8) != 0 ? kittyCsiU(13, keyMode, eventType) : null;
+            case KEYCODE_TAB: return (flags & 8) != 0 ? kittyCsiU(9, keyMode, eventType) : null;
+            case KEYCODE_DEL: return (flags & 8) != 0 ? kittyCsiU(127, keyMode, eventType) : null;
+            case KEYCODE_ESCAPE: return kittyCsiU(27, keyMode, eventType);
+            default: break;
+        }
+
+        // Functional keys keep the legacy compatible forms defined by the kitty protocol:
+        //
+        //   CSI 1 ; modifier [ABCDEFHPQS]   arrows, Home, End
+        //   CSI number ; modifier ~         Insert, Delete, PageUp, PageDown, F1-F12
+        //
+        // The Private Use Area numbers are only used for keys that have no legacy encoding (for
+        // example caps lock), not for arrows or the other keys above. Using them here made every
+        // kitty aware application (fish, nushell, neovim, yazi, ...) ignore the key entirely.
+        switch (keyCode) {
+            case KEYCODE_DPAD_UP: return kittyCsiKey('A', keyMode, eventType);
+            case KEYCODE_DPAD_DOWN: return kittyCsiKey('B', keyMode, eventType);
+            case KEYCODE_DPAD_RIGHT: return kittyCsiKey('C', keyMode, eventType);
+            case KEYCODE_DPAD_LEFT: return kittyCsiKey('D', keyMode, eventType);
+            case KEYCODE_MOVE_HOME: return kittyCsiKey('H', keyMode, eventType);
+            case KEYCODE_MOVE_END: return kittyCsiKey('F', keyMode, eventType);
+            case KEYCODE_INSERT: return kittyTildeKey(2, keyMode, eventType);
+            case KEYCODE_FORWARD_DEL: return kittyTildeKey(3, keyMode, eventType);
+            case KEYCODE_PAGE_UP: return kittyTildeKey(5, keyMode, eventType);
+            case KEYCODE_PAGE_DOWN: return kittyTildeKey(6, keyMode, eventType);
+            case KEYCODE_F1: return kittyTildeKey(11, keyMode, eventType);
+            case KEYCODE_F2: return kittyTildeKey(12, keyMode, eventType);
+            case KEYCODE_F3: return kittyTildeKey(13, keyMode, eventType);
+            case KEYCODE_F4: return kittyTildeKey(14, keyMode, eventType);
+            case KEYCODE_F5: return kittyTildeKey(15, keyMode, eventType);
+            case KEYCODE_F6: return kittyTildeKey(17, keyMode, eventType);
+            case KEYCODE_F7: return kittyTildeKey(18, keyMode, eventType);
+            case KEYCODE_F8: return kittyTildeKey(19, keyMode, eventType);
+            case KEYCODE_F9: return kittyTildeKey(20, keyMode, eventType);
+            case KEYCODE_F10: return kittyTildeKey(21, keyMode, eventType);
+            case KEYCODE_F11: return kittyTildeKey(23, keyMode, eventType);
+            case KEYCODE_F12: return kittyTildeKey(24, keyMode, eventType);
+            default: return null;
+        }
+    }
+
+    /** Build "CSI 1 ; modifiers : event [final]" with the parameter omitted when it is the default. */
+    private static String kittyCsiKey(char finalChar, int keyMode, int eventType) {
+        String modifier = kittyModifierSuffix(keyMode, eventType);
+        if (modifier.isEmpty()) return "\033[" + finalChar;
+        return "\033[1" + modifier + finalChar;
+    }
+
+    /** Build "CSI number ; modifiers : event ~". */
+    private static String kittyTildeKey(int number, int keyMode, int eventType) {
+        return "\033[" + number + kittyModifierSuffix(keyMode, eventType) + '~';
+    }
+
+    /** Build "CSI number ; modifiers : event u". */
+    private static String kittyCsiU(int number, int keyMode, int eventType) {
+        return "\033[" + number + kittyModifierSuffix(keyMode, eventType) + 'u';
+    }
+
+    /** @return "" when no modifiers and a press event make the parameter unnecessary. */
+    private static String kittyModifierSuffix(int keyMode, int eventType) {
+        int modifier = 1;
+        if ((keyMode & KEYMOD_SHIFT) != 0) modifier += 1;
+        if ((keyMode & KEYMOD_ALT) != 0) modifier += 2;
+        if ((keyMode & KEYMOD_CTRL) != 0) modifier += 4;
+        if (eventType != 1) return ";" + modifier + ":" + eventType;
+        return modifier == 1 ? "" : ";" + modifier;
+    }
+
     public static String getCode(int keyCode, int keyMode, boolean cursorApp, boolean keypadApplication) {
         boolean numLockOn = (keyMode & KEYMOD_NUM_LOCK) != 0;
         keyMode &= ~KEYMOD_NUM_LOCK;

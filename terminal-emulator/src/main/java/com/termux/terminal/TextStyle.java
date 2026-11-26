@@ -8,7 +8,7 @@ package com.termux.terminal;
  * <p>
  * The bit layout is:
  * </p>
- * - 16 flags (11 currently used).
+ * - 16 flags (14 currently used).
  * - 24 for foreground color (only 9 first bits if a color index).
  * - 24 for background color (only 9 first bits if a color index).
  */
@@ -38,6 +38,29 @@ public final class TextStyle {
     /** If true, character represents a {@link TerminalBitmap} slice, not text. */
     public final static int TERMINAL_BITMAP = 1 << 15;
 
+    /** Underline style values, matching the kitty underline specification (SGR 4:x). */
+    public final static int UNDERLINE_STYLE_NONE = 0;
+    public final static int UNDERLINE_STYLE_SINGLE = 1;
+    public final static int UNDERLINE_STYLE_DOUBLE = 2;
+    public final static int UNDERLINE_STYLE_CURLY = 3;
+    public final static int UNDERLINE_STYLE_DOTTED = 4;
+    public final static int UNDERLINE_STYLE_DASHED = 5;
+
+    /** The underline style occupies three otherwise unused effect bits (11-13). */
+    private final static int UNDERLINE_STYLE_SHIFT = 11;
+    private final static int UNDERLINE_STYLE_MASK = 0b111 << UNDERLINE_STYLE_SHIFT;
+
+    /** All the effect bits that {@link #encode(int, int, int)} keeps. */
+    private final static int EFFECT_MASK = 0b11111111111111;
+
+    /** Extra per-cell style data: set if an explicit underline color is stored. */
+    private final static long EXTRA_UNDERLINE_COLOR_PRESENT = 1L << 24;
+    /** Extra per-cell style data: set if the underline color is an indexed palette entry. */
+    private final static long EXTRA_UNDERLINE_COLOR_INDEXED = 1L << 25;
+    /** Extra per-cell style data: shifted hyperlink table id (0 means none). */
+    private final static int EXTRA_HYPERLINK_SHIFT = 32;
+    private final static long EXTRA_HYPERLINK_MASK = 0xFFFFL << EXTRA_HYPERLINK_SHIFT;
+
     public final static int COLOR_INDEX_FOREGROUND = 256;
     public final static int COLOR_INDEX_BACKGROUND = 257;
     public final static int COLOR_INDEX_CURSOR = 258;
@@ -49,7 +72,7 @@ public final class TextStyle {
     final static long NORMAL = encode(COLOR_INDEX_FOREGROUND, COLOR_INDEX_BACKGROUND, 0);
 
     static long encode(int foreColor, int backColor, int effect) {
-        long result = effect & 0b111111111;
+        long result = effect & EFFECT_MASK;
         if ((0xff000000 & foreColor) == 0xff000000) {
             // 24-bit color.
             result |= CHARACTER_ATTRIBUTE_TRUECOLOR_FOREGROUND | ((foreColor & 0x00ffffffL) << 40L);
@@ -86,7 +109,54 @@ public final class TextStyle {
     }
 
     public static int decodeEffect(long style) {
-        return (int) (style & 0b11111111111);
+        return (int) (style & (EFFECT_MASK & ~UNDERLINE_STYLE_MASK));
+    }
+
+    public static int decodeUnderlineStyle(long style) {
+        return (int) ((style & UNDERLINE_STYLE_MASK) >>> UNDERLINE_STYLE_SHIFT);
+    }
+
+    public static long encodeUnderlineStyle(long style, int underlineStyle) {
+        return (style & ~UNDERLINE_STYLE_MASK)
+            | (((long) (underlineStyle & 0b111)) << UNDERLINE_STYLE_SHIFT);
+    }
+
+    /**
+     * Encode the extended per-cell attributes that do not fit in the 64 bit style.
+     *
+     * @param underlineColor the explicit underline color as ARGB, or a negative value to use the
+     *                       foreground color.
+     * @param hyperlinkId    the id of an OSC 8 hyperlink, or 0 for none.
+     */
+    public static long encodeExtra(int underlineColor, int hyperlinkId) {
+        long extra = 0;
+        if (underlineColor != -1) {
+            extra |= EXTRA_UNDERLINE_COLOR_PRESENT;
+            if ((underlineColor & 0xff000000) == 0xff000000) {
+                extra |= underlineColor & 0x00FFFFFFL;
+            } else {
+                extra |= EXTRA_UNDERLINE_COLOR_INDEXED | (underlineColor & 0b111111111L);
+            }
+        }
+        if (hyperlinkId > 0) {
+            extra |= ((long) (hyperlinkId & 0xFFFF)) << EXTRA_HYPERLINK_SHIFT;
+        }
+        return extra;
+    }
+
+    /**
+     * @return the explicit underline color as ARGB, an indexed palette entry (0-258) if the high
+     * alpha byte is not 0xff, or -1 to use the foreground color.
+     */
+    public static int decodeUnderlineColor(long extra) {
+        if ((extra & EXTRA_UNDERLINE_COLOR_PRESENT) == 0) return -1;
+        if ((extra & EXTRA_UNDERLINE_COLOR_INDEXED) != 0) return (int) (extra & 0b111111111L);
+        return 0xff000000 | (int) (extra & 0x00FFFFFFL);
+    }
+
+    /** @return the OSC 8 hyperlink id, or 0 if the cell is not part of a hyperlink. */
+    public static int decodeHyperlinkId(long extra) {
+        return (int) ((extra & EXTRA_HYPERLINK_MASK) >>> EXTRA_HYPERLINK_SHIFT);
     }
 
 

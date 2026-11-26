@@ -26,6 +26,17 @@ public interface TerminalSessionClient {
 
     void onTerminalCursorStateChange(boolean state);
 
+    /** Called for OSC 9, OSC 99 and OSC 777 notification sequences. */
+    void onTerminalNotification(@Nullable String title, @NonNull String body);
+
+    /**
+     * Called for OSC 9;4 progress sequences.
+     *
+     * @param state 0 = clear, 1 = normal, 2 = error, 3 = indeterminate, 4 = paused.
+     * @param progress 0-100, or -1 for indeterminate.
+     */
+    void onTerminalProgress(int state, int progress);
+
     void setTerminalShellPid(@NonNull TerminalSession session, int pid);
 
 

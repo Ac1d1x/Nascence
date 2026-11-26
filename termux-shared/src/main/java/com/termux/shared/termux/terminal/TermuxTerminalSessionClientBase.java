@@ -45,6 +45,14 @@ public class TermuxTerminalSessionClientBase implements TerminalSessionClient {
     }
 
     @Override
+    public void onTerminalNotification(@Nullable String title, @NonNull String body) {
+    }
+
+    @Override
+    public void onTerminalProgress(int state, int progress) {
+    }
+
+    @Override
     public void setTerminalShellPid(@NonNull TerminalSession session, int pid) {
     }
 

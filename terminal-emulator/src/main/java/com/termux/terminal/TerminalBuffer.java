@@ -1,7 +1,10 @@
 package com.termux.terminal;
 
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashSet;
+import java.util.List;
+import java.util.Locale;
 import java.util.Set;
 import java.util.HashMap;
 
@@ -33,6 +36,8 @@ public final class TerminalBuffer {
     private int mActiveTranscriptRows = 0;
     /** The index in the circular buffer where the visible screen starts. */
     private int mScreenFirstRow = 0;
+    /** Total number of lines that have scrolled off the top, used to give lines a stable identity. */
+    private long mTotalLinesScrolled = 0;
 
 
     /**
@@ -217,6 +222,11 @@ public final class TerminalBuffer {
         return mActiveTranscriptRows + mScreenRows;
     }
 
+    /** Number of lines that have scrolled off the top since this buffer was created. */
+    public long getTotalLinesScrolled() {
+        return mTotalLinesScrolled;
+    }
+
     /**
      * Convert a row value from the public external coordinate system to our internal private coordinate system.
      *
@@ -363,13 +373,17 @@ public final class TerminalBuffer {
 
                 int currentOldCol = 0;
                 long styleAtCol = 0;
+                long extraStyleAtCol = 0;
                 for (int i = 0; i < lastNonSpaceIndex; i++) {
                     // Note that looping over java character, not cells.
                     char c = oldLine.mText[i];
                     int codePoint = (Character.isHighSurrogate(c)) ? Character.toCodePoint(c, oldLine.mText[++i]) : c;
                     int displayWidth = WcWidth.width(codePoint);
                     // Use the last style if this is a zero-width character:
-                    if (displayWidth > 0) styleAtCol = oldLine.getStyle(currentOldCol);
+                    if (displayWidth > 0) {
+                        styleAtCol = oldLine.getStyle(currentOldCol);
+                        extraStyleAtCol = oldLine.getExtraStyle(currentOldCol);
+                    }
 
                     // Line wrap as necessary:
                     if (currentOutputExternalColumn + displayWidth > mColumns) {
@@ -385,7 +399,7 @@ public final class TerminalBuffer {
 
                     int offsetDueToCombiningChar = ((displayWidth <= 0 && currentOutputExternalColumn > 0) ? 1 : 0);
                     int outputColumn = currentOutputExternalColumn - offsetDueToCombiningChar;
-                    setChar(outputColumn, currentOutputExternalRow, codePoint, styleAtCol);
+                    setChar(outputColumn, currentOutputExternalRow, codePoint, styleAtCol, extraStyleAtCol);
 
                     if (displayWidth > 0) {
                         if (oldCursorRow == externalOldRow && oldCursorColumn == currentOldCol) {
@@ -458,6 +472,7 @@ public final class TerminalBuffer {
 
         // Update the screen location in the ring buffer:
         mScreenFirstRow = (mScreenFirstRow + 1) % mTotalRows;
+        mTotalLinesScrolled++;
         // Note that the history has grown if not already full:
         if (mActiveTranscriptRows < mTotalRows - mScreenRows) mActiveTranscriptRows++;
 
@@ -522,14 +537,59 @@ public final class TerminalBuffer {
     }
 
     public void setChar(int column, int row, int codePoint, long style) {
+        setChar(column, row, codePoint, style, 0);
+    }
+
+    public void setChar(int column, int row, int codePoint, long style, long extraStyle) {
         if (row  < 0 || row >= mScreenRows || column < 0 || column >= mColumns)
             throw new IllegalArgumentException("TerminalBuffer.setChar(): row=" + row + ", column=" + column + ", mScreenRows=" + mScreenRows + ", mColumns=" + mColumns);
         row = externalToInternalRow(row);
-        allocateFullLineIfNecessary(row).setChar(column, codePoint, style);
+        allocateFullLineIfNecessary(row).setChar(column, codePoint, style, extraStyle);
     }
 
     public long getStyleAt(int externalRow, int column) {
         return allocateFullLineIfNecessary(externalToInternalRow(externalRow)).getStyle(column);
+    }
+
+    public long getExtraStyleAt(int externalRow, int column) {
+        return allocateFullLineIfNecessary(externalToInternalRow(externalRow)).getExtraStyle(column);
+    }
+
+    /**
+     * Find a plain text query in the visible screen and the scrollback, case-insensitively.
+     *
+     * @return a list of {@code {externalRow, startColumn, endColumn}} triples. Matches do not span
+     * wrapped lines.
+     */
+    public List<int[]> search(String query) {
+        List<int[]> matches = new ArrayList<>();
+        if (query == null || query.isEmpty()) return matches;
+
+        String needle = query.toLowerCase(Locale.ROOT);
+        int firstRow = -getActiveTranscriptRows();
+        int lastRow = mScreenRows - 1;
+        for (int externalRow = firstRow; externalRow <= lastRow; externalRow++) {
+            TerminalRow line = mLines[externalToInternalRow(externalRow)];
+            if (line == null) continue;
+
+            String text = line.getText();
+            if (text.isEmpty()) continue;
+            String haystack = text.toLowerCase(Locale.ROOT);
+
+            int fromIndex = 0;
+            while (fromIndex <= haystack.length() - needle.length()) {
+                int charIndex = haystack.indexOf(needle, fromIndex);
+                if (charIndex < 0) break;
+
+                int startColumn = line.getColumnForCharIndex(charIndex);
+                int endColumn = line.getColumnForCharIndex(charIndex + needle.length());
+                if (endColumn > startColumn) {
+                    matches.add(new int[]{externalRow, startColumn, endColumn - 1});
+                }
+                fromIndex = charIndex + Math.max(1, needle.length());
+            }
+        }
+        return matches;
     }
 
     /** Support for http://vt100.net/docs/vt510-rm/DECCARA and http://vt100.net/docs/vt510-rm/DECCARA */

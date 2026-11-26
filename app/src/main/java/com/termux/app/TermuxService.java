@@ -2,6 +2,7 @@ package com.termux.app;
 
 import android.annotation.SuppressLint;
 import android.app.Notification;
+import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.app.Service;
@@ -17,9 +18,12 @@ import android.os.PowerManager;
 
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
+import androidx.core.content.ContextCompat;
 
 import com.termux.R;
 import com.termux.app.event.SystemEventReceiver;
+import com.termux.app.overlay.TermuxOverlayLauncherActivity;
+import com.termux.app.overlay.TermuxOverlayManager;
 import com.termux.app.terminal.TermuxTerminalSessionActivityClient;
 import com.termux.app.terminal.TermuxTerminalSessionServiceClient;
 import com.termux.shared.termux.plugins.TermuxPluginUtils;
@@ -98,6 +102,9 @@ public final class TermuxService extends Service implements AppShell.AppShellCli
      */
     private TermuxShellManager mShellManager;
 
+    /** The floating terminal, its bubble and its dedicated session. Created lazily. */
+    private TermuxOverlayManager mOverlayManager;
+
     /** The wake lock and wifi lock are always acquired and released together. */
     private PowerManager.WakeLock mWakeLock;
     private WifiManager.WifiLock mWifiLock;
@@ -120,6 +127,9 @@ public final class TermuxService extends Service implements AppShell.AppShellCli
         runStartForeground();
 
         SystemEventReceiver.registerPackageUpdateEvents(this);
+
+        if (mOverlayManager == null)
+            mOverlayManager = new TermuxOverlayManager(this);
     }
 
     @SuppressLint("Wakelock")
@@ -154,6 +164,10 @@ public final class TermuxService extends Service implements AppShell.AppShellCli
                     Logger.logDebug(LOG_TAG, "ACTION_SERVICE_EXECUTE intent received");
                     actionServiceExecute(intent);
                     break;
+                case TermuxOverlayManager.ACTION_TOGGLE_OVERLAY:
+                    Logger.logDebug(LOG_TAG, "ACTION_TOGGLE_OVERLAY intent received");
+                    getOverlayManager().toggle();
+                    break;
                 default:
                     Logger.logError(LOG_TAG, "Invalid action: \"" + action + "\"");
                     break;
@@ -166,8 +180,19 @@ public final class TermuxService extends Service implements AppShell.AppShellCli
     }
 
     @Override
+    public void onConfigurationChanged(@NonNull android.content.res.Configuration newConfig) {
+        super.onConfigurationChanged(newConfig);
+        if (mOverlayManager != null) mOverlayManager.onConfigurationChanged();
+    }
+
+    @Override
     public void onDestroy() {
         Logger.logVerbose(LOG_TAG, "onDestroy");
+
+        if (mOverlayManager != null) {
+            mOverlayManager.destroy();
+            mOverlayManager = null;
+        }
 
         TermuxShellUtils.clearTermuxTMPDIR(true);
 
@@ -749,6 +774,79 @@ public final class TermuxService extends Service implements AppShell.AppShellCli
             return mTermuxTerminalSessionServiceClient;
     }
 
+    /** Get the floating terminal manager, creating it on first use. */
+    @NonNull
+    public synchronized TermuxOverlayManager getOverlayManager() {
+        if (mOverlayManager == null)
+            mOverlayManager = new TermuxOverlayManager(this);
+        return mOverlayManager;
+    }
+
+    /** True while the floating terminal or its bubble exists. */
+    public synchronized boolean isOverlayActive() {
+        return mOverlayManager != null && mOverlayManager.isActive();
+    }
+
+    /** Refresh the foreground notification after the floating terminal is shown or hidden. */
+    public void updateNotificationFromOverlay() {
+        updateNotification();
+    }
+
+    /** The terminal session currently owned by the floating terminal, if any. */
+    private TerminalSession getOverlayTerminalSession() {
+        return mOverlayManager == null ? null : mOverlayManager.getTerminalSession();
+    }
+
+    /** Ask the activity's drawer to rebuild the session list. */
+    public void notifySessionListChanged() {
+        if (mTermuxTerminalSessionActivityClient != null)
+            mTermuxTerminalSessionActivityClient.termuxSessionListNotifyUpdated();
+    }
+
+    /**
+     * Hands the floating terminal's session over to the activity's terminal view. Returns true if
+     * the session really was the floating terminal's.
+     */
+    public synchronized boolean releaseOverlaySession(TerminalSession session) {
+        return mOverlayManager != null && mOverlayManager.releaseSession(session);
+    }
+
+    /** True if the floating terminal currently owns the given session. */
+    public synchronized boolean isOverlaySession(TerminalSession session) {
+        return session != null && mOverlayManager != null
+            && session == mOverlayManager.getTerminalSession();
+    }
+
+    /** Rolls the floating terminal up so it stops covering the session drawer. */
+    public synchronized void collapseOverlayForDrawer() {
+        if (mOverlayManager != null && mOverlayManager.isVisible() && !mOverlayManager.isCollapsed())
+            mOverlayManager.collapse();
+    }
+
+    /**
+     * Detaches the activity's terminal view from a session the floating terminal is taking back.
+     */
+    public synchronized void detachSessionFromActivity(TerminalSession session) {
+        if (mTermuxTerminalSessionActivityClient != null)
+            mTermuxTerminalSessionActivityClient.detachSession(session);
+    }
+
+    /** Removes a finished floating-terminal session from the shared session list. */
+    public synchronized void removeFinishedOverlaySession(TermuxSession session) {
+        if (session == null) return;
+        mShellManager.mTermuxSessions.remove(session);
+        notifySessionListChanged();
+    }
+
+    /** Adds the floating terminal's session to the shared session list. */
+    public synchronized void registerOverlayTermuxSession(TermuxSession session) {
+        if (session == null) return;
+        if (!mShellManager.mTermuxSessions.contains(session))
+            mShellManager.mTermuxSessions.add(session);
+        notifySessionListChanged();
+        updateNotification();
+    }
+
     /** This should be called when {@link TermuxActivity#onServiceConnected} is called to set the
      * {@link TermuxService#mTermuxTerminalSessionActivityClient} variable and update the {@link TerminalSession}
      * and {@link TerminalEmulator} clients in case they were passed {@link TermuxTerminalSessionServiceClient}
@@ -760,8 +858,14 @@ public final class TermuxService extends Service implements AppShell.AppShellCli
     public synchronized void setTermuxTerminalSessionClient(TermuxTerminalSessionActivityClient termuxTerminalSessionActivityClient) {
         mTermuxTerminalSessionActivityClient = termuxTerminalSessionActivityClient;
 
-        for (int i = 0; i < mShellManager.mTermuxSessions.size(); i++)
-            mShellManager.mTermuxSessions.get(i).getTerminalSession().updateTerminalSessionClient(mTermuxTerminalSessionActivityClient);
+        // The floating terminal owns its session's client while it is open, otherwise the overlay
+        // would stop receiving screen updates as soon as the activity connects.
+        TerminalSession overlaySession = getOverlayTerminalSession();
+        for (int i = 0; i < mShellManager.mTermuxSessions.size(); i++) {
+            TerminalSession session = mShellManager.mTermuxSessions.get(i).getTerminalSession();
+            if (session != overlaySession)
+                session.updateTerminalSessionClient(mTermuxTerminalSessionActivityClient);
+        }
     }
 
     /** This should be called when {@link TermuxActivity} has been destroyed and in {@link #onUnbind(Intent)}
@@ -769,8 +873,12 @@ public final class TermuxService extends Service implements AppShell.AppShellCli
      * clients do not hold an activity references.
      */
     public synchronized void unsetTermuxTerminalSessionClient() {
-        for (int i = 0; i < mShellManager.mTermuxSessions.size(); i++)
-            mShellManager.mTermuxSessions.get(i).getTerminalSession().updateTerminalSessionClient(mTermuxTerminalSessionServiceClient);
+        TerminalSession overlaySession = getOverlayTerminalSession();
+        for (int i = 0; i < mShellManager.mTermuxSessions.size(); i++) {
+            TerminalSession session = mShellManager.mTermuxSessions.get(i).getTerminalSession();
+            if (session != overlaySession)
+                session.updateTerminalSessionClient(mTermuxTerminalSessionServiceClient);
+        }
 
         mTermuxTerminalSessionActivityClient = null;
     }
@@ -780,23 +888,56 @@ public final class TermuxService extends Service implements AppShell.AppShellCli
 
 
     private Notification buildNotification() {
-        Resources res = getResources();
+        final Resources res = getResources();
+        final String appName = res.getString(R.string.application_name);
 
         // Set pending intent to be launched when notification is clicked
         Intent notificationIntent = TermuxActivity.newInstance(this);
-        PendingIntent contentIntent = PendingIntent.getActivity(this, 0, notificationIntent, 0);
-
+        PendingIntent contentIntent = PendingIntent.getActivity(this, 0, notificationIntent, pendingIntentFlags());
 
         // Set notification text
         int sessionCount = getTermuxSessionsSize();
         int taskCount = mShellManager.mTermuxTasks.size();
-        String notificationText = sessionCount + " session" + (sessionCount == 1 ? "" : "s");
+        final boolean wakeLockHeld = mWakeLock != null;
+
+        StringBuilder notificationText = new StringBuilder();
+        if (sessionCount > 0) {
+            notificationText.append(res.getQuantityString(R.plurals.notification_session_count, sessionCount, sessionCount));
+        }
         if (taskCount > 0) {
-            notificationText += ", " + taskCount + " task" + (taskCount == 1 ? "" : "s");
+            if (notificationText.length() > 0) notificationText.append(" · ");
+            notificationText.append(res.getQuantityString(R.plurals.notification_task_count, taskCount, taskCount));
+        }
+        if (wakeLockHeld) {
+            if (notificationText.length() > 0) notificationText.append(" · ");
+            notificationText.append(res.getString(R.string.notification_wakelock_held));
+        }
+        boolean overlayActive = mOverlayManager != null && mOverlayManager.isActive();
+        if (overlayActive) {
+            if (notificationText.length() > 0) notificationText.append(" · ");
+            notificationText.append(res.getString(R.string.overlay_notification_running));
+        }
+        if (notificationText.length() == 0) {
+            notificationText.append(res.getString(R.string.notification_idle));
         }
 
-        final boolean wakeLockHeld = mWakeLock != null;
-        if (wakeLockHeld) notificationText += " (wake lock held)";
+        // Expanded body: one bullet per terminal session so the notification is useful at a glance.
+        StringBuilder details = new StringBuilder();
+        final int maxListedSessions = 6;
+        int listedSessions = 0;
+        for (TermuxSession session : mShellManager.mTermuxSessions) {
+            if (listedSessions >= maxListedSessions) break;
+            if (details.length() > 0) details.append('\n');
+            details.append("• ").append(getSessionDisplayName(session, res));
+            listedSessions++;
+        }
+        if (sessionCount > listedSessions) {
+            details.append('\n').append(res.getString(R.string.notification_more_sessions, sessionCount - listedSessions));
+        }
+        if (overlayActive) {
+            if (details.length() > 0) details.append('\n');
+            details.append("• ").append(res.getString(R.string.overlay_session_name));
+        }
 
 
         // Set notification priority
@@ -806,11 +947,11 @@ public final class TermuxService extends Service implements AppShell.AppShellCli
 
 
         // Build the notification
-        Notification.Builder builder =  NotificationUtils.geNotificationBuilder(this,
+        Notification.Builder builder = NotificationUtils.geNotificationBuilder(this,
             TermuxConstants.TERMUX_APP_NOTIFICATION_CHANNEL_ID, priority,
-            TermuxConstants.TERMUX_APP_NAME, notificationText, null,
+            appName, notificationText, details.length() > 0 ? details : null,
             contentIntent, null, NotificationUtils.NOTIFICATION_MODE_SILENT);
-        if (builder == null)  return null;
+        if (builder == null) return null;
 
         // No need to show a timestamp:
         builder.setShowWhen(false);
@@ -819,15 +960,34 @@ public final class TermuxService extends Service implements AppShell.AppShellCli
         builder.setSmallIcon(R.drawable.ic_service_notification);
 
         // Set background color for small notification icon
-        builder.setColor(0xFF607D8B);
+        builder.setColor(ContextCompat.getColor(this, R.color.notification_accent));
 
         // TermuxSessions are always ongoing
         builder.setOngoing(true);
+        builder.setOnlyAlertOnce(true);
+        builder.setCategory(Notification.CATEGORY_SERVICE);
+        builder.setLocalOnly(true);
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            // Start the foreground service notification right away instead of letting the system
+            // hold it back for up to 10 seconds.
+            builder.setForegroundServiceBehavior(Notification.FOREGROUND_SERVICE_IMMEDIATE);
+        }
 
 
-        // Set Exit button action
-        Intent exitIntent = new Intent(this, TermuxService.class).setAction(TERMUX_SERVICE.ACTION_STOP_SERVICE);
-        builder.addAction(android.R.drawable.ic_delete, res.getString(R.string.notification_action_exit), PendingIntent.getService(this, 0, exitIntent, 0));
+        // Set New session button action
+        Intent newSessionIntent = TermuxActivity.newInstance(this).setAction(Intent.ACTION_RUN);
+        PendingIntent newSessionPendingIntent = PendingIntent.getActivity(this, 1, newSessionIntent, pendingIntentFlags());
+        builder.addAction(R.drawable.ic_notification_new_session, res.getString(R.string.action_new_session), newSessionPendingIntent);
+
+        // Set floating terminal button action. An activity is used instead of a service so that
+        // the overlay permission can be requested directly and Notification trampolines are avoided.
+        boolean overlayVisible = mOverlayManager != null && mOverlayManager.isVisible()
+            && !mOverlayManager.isCollapsed();
+        Intent overlayIntent = new Intent(this, TermuxOverlayLauncherActivity.class);
+        builder.addAction(R.drawable.ic_notification_overlay,
+            res.getString(overlayVisible ? R.string.overlay_action_hide : R.string.overlay_action_show),
+            PendingIntent.getActivity(this, 4, overlayIntent, pendingIntentFlags()));
 
 
         // Set Wakelock button actions
@@ -835,22 +995,53 @@ public final class TermuxService extends Service implements AppShell.AppShellCli
         Intent toggleWakeLockIntent = new Intent(this, TermuxService.class).setAction(newWakeAction);
         String actionTitle = res.getString(wakeLockHeld ? R.string.notification_action_wake_unlock : R.string.notification_action_wake_lock);
         int actionIcon = wakeLockHeld ? android.R.drawable.ic_lock_idle_lock : android.R.drawable.ic_lock_lock;
-        builder.addAction(actionIcon, actionTitle, PendingIntent.getService(this, 0, toggleWakeLockIntent, 0));
+        builder.addAction(actionIcon, actionTitle, PendingIntent.getService(this, 2, toggleWakeLockIntent, pendingIntentFlags()));
+
+
+        // Set Exit button action
+        Intent exitIntent = new Intent(this, TermuxService.class).setAction(TERMUX_SERVICE.ACTION_STOP_SERVICE);
+        builder.addAction(android.R.drawable.ic_delete, res.getString(R.string.notification_action_exit), PendingIntent.getService(this, 3, exitIntent, pendingIntentFlags()));
 
 
         return builder.build();
     }
 
+    /** Get a stable, human readable name for a session without leaking nulls into the notification. */
+    private static String getSessionDisplayName(TermuxSession termuxSession, Resources res) {
+        TerminalSession terminalSession = termuxSession.getTerminalSession();
+        String name = terminalSession == null ? null : terminalSession.mSessionName;
+        if (name == null || name.trim().isEmpty()) return res.getString(R.string.notification_unnamed_session);
+        return name.trim();
+    }
+
+    private static int pendingIntentFlags() {
+        return Build.VERSION.SDK_INT >= Build.VERSION_CODES.M
+            ? PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE
+            : PendingIntent.FLAG_UPDATE_CURRENT;
+    }
+
     private void setupNotificationChannel() {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return;
 
-        NotificationUtils.setupNotificationChannel(this, TermuxConstants.TERMUX_APP_NOTIFICATION_CHANNEL_ID,
-            TermuxConstants.TERMUX_APP_NOTIFICATION_CHANNEL_NAME, NotificationManager.IMPORTANCE_LOW);
+        NotificationManager notificationManager = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+        if (notificationManager == null) return;
+
+        Resources res = getResources();
+        NotificationChannel channel = new NotificationChannel(
+            TermuxConstants.TERMUX_APP_NOTIFICATION_CHANNEL_ID,
+            res.getString(R.string.notification_channel_name),
+            NotificationManager.IMPORTANCE_LOW);
+        channel.setDescription(res.getString(R.string.notification_channel_description));
+        channel.setShowBadge(false);
+        channel.setSound(null, null);
+        channel.enableVibration(false);
+        channel.enableLights(false);
+        notificationManager.createNotificationChannel(channel);
     }
 
     /** Update the shown foreground service notification after making any changes that affect it. */
     private synchronized void updateNotification() {
-        if (mWakeLock == null && mShellManager.mTermuxSessions.isEmpty() && mShellManager.mTermuxTasks.isEmpty()) {
+        if (mWakeLock == null && mShellManager.mTermuxSessions.isEmpty() && mShellManager.mTermuxTasks.isEmpty() && !isOverlayActive()) {
             // Exit if we are updating after the user disabled all locks with no sessions or tasks running.
             requestStopService();
         } else {

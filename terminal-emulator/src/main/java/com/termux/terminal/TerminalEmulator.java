@@ -3,8 +3,12 @@ package com.termux.terminal;
 import android.util.Base64;
 
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashMap;
+import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Stack;
 
@@ -171,6 +175,10 @@ public final class TerminalEmulator {
     private static final int ESC_CSI_UNSUPPORTED_PARAMETER_BYTE = 22;
     /** Escape processing: ESC [ <parameter bytes> <intermediate bytes> */
     private static final int ESC_CSI_UNSUPPORTED_INTERMEDIATE_BYTE = 23;
+    /** Escape processing: ESC [ < <parameter bytes> */
+    private static final int ESC_CSI_KITTY_POP = 24;
+    /** Escape processing: ESC [ = <parameter bytes> */
+    private static final int ESC_CSI_KITTY_SET = 25;
 
     /** The number of parameter arguments including colon separated sub-parameters. */
     private static final int MAX_ESCAPE_PARAMETERS = 32;
@@ -210,10 +218,34 @@ public final class TerminalEmulator {
     private static final int DECSET_BIT_LEFTRIGHT_MARGIN_MODE = 1 << 11;
     /** Not really DECSET bit... - http://www.vt100.net/docs/vt510-rm/DECSACE */
     private static final int DECSET_BIT_RECTANGULAR_CHANGEATTRIBUTE = 1 << 12;
+    /** DECSET 2026 - synchronized output, used by full screen TUI apps to avoid tearing. */
+    private static final int DECSET_BIT_SYNCHRONIZED_OUTPUT = 1 << 13;
 
 
     private String mTitle;
     private final Stack<String> mTitleStack = new Stack<>();
+
+    /** Last working directory reported with OSC 7. */
+    private String mCurrentWorkingDirectory;
+    /** Absolute line numbers of OSC 133 prompt starts, for jumping between prompts. */
+    private final List<Long> mPromptLines = new ArrayList<>();
+    private static final int MAX_PROMPT_LINES = 2048;
+    /** OSC 9;4 progress state and percentage, or -1 when inactive. */
+    private int mProgressState = -1;
+    private int mProgressValue = -1;
+
+    /**
+     * Kitty keyboard protocol state. The specification requires the main and alternate screens to
+     * keep independent flags and stacks, so a full screen application that crashes without popping
+     * its flags cannot leave the shell prompt with a broken keyboard.
+     */
+    private static final class KittyKeyboardState {
+        int flags;
+        final int[] stack = new int[16];
+        int stackSize;
+    }
+    private final KittyKeyboardState mMainKittyKeyboardState = new KittyKeyboardState();
+    private final KittyKeyboardState mAltKittyKeyboardState = new KittyKeyboardState();
 
     /** The cursor position. Between (0,0) and (mRows-1, mColumns-1). */
     private int mCursorRow, mCursorCol;
@@ -416,7 +448,14 @@ public final class TerminalEmulator {
      *
      * @see TextStyle
      */
-    int mForeColor, mBackColor, mUnderlineColor;
+    int mForeColor, mBackColor, mUnderlineColor = -1;
+
+    /** Currently active OSC 8 hyperlink id, or 0 if none. */
+    private int mHyperlinkId;
+    private final Map<String, Integer> mHyperlinkIds = new HashMap<>();
+    private final List<String> mHyperlinks = new ArrayList<>();
+    /** Keeps the OSC 8 hyperlink table from growing without bound. */
+    private static final int MAX_HYPERLINKS = 4096;
 
     /** Current {@link TextStyle} effect. */
     int mEffect;
@@ -487,6 +526,8 @@ public final class TerminalEmulator {
                 return DECSET_BIT_MOUSE_PROTOCOL_SGR;
             case 2004:
                 return DECSET_BIT_BRACKETED_PASTE_MODE;
+            case 2026:
+                return DECSET_BIT_SYNCHRONIZED_OUTPUT;
             default:
                 return -1;
             // throw new IllegalArgumentException("Unsupported decset: " + decsetBit);
@@ -900,6 +941,12 @@ public final class TerminalEmulator {
                         break;
                     case ESC_CSI_BIGGERTHAN:
                         doCsiBiggerThan(b);
+                        break;
+                    case ESC_CSI_KITTY_POP:
+                        doCsiKittyPop(b);
+                        break;
+                    case ESC_CSI_KITTY_SET:
+                        doCsiKittySet(b);
                         break;
                     case ESC_CSI_DOLLAR:
                         boolean originMode = isDecsetInternalBitSet(DECSET_BIT_ORIGIN_MODE);
@@ -1760,6 +1807,9 @@ public final class TerminalEmulator {
                         return;
                 }
                 break;
+            case 'u': // "${CSI}?u" - Query kitty keyboard protocol flags.
+                mSession.write("\033[?" + getKittyKeyboardFlags() + "u");
+                break;
             case 'r':
             case 's':
                 if (mArgIndex >= mArgs.length) mArgIndex = mArgs.length - 1;
@@ -1887,6 +1937,12 @@ public final class TerminalEmulator {
 
     private void doCsiBiggerThan(int b) {
         switch (b) {
+            case 'u': // "${CSI}>${FLAGS}u" - Push kitty keyboard protocol flags.
+                KittyKeyboardState kittyState = getActiveKittyKeyboardState();
+                if (kittyState.stackSize < kittyState.stack.length)
+                    kittyState.stack[kittyState.stackSize++] = kittyState.flags;
+                kittyState.flags = getArg0(0);
+                break;
             case 'c': // "${CSI}>c" or "${CSI}>c". Secondary Device Attributes (DA2).
                 // Originally this was used for the terminal to respond with "identification code, firmware version level,
                 // and hardware options" (http://vt100.net/docs/vt510-rm/DA2), with the first "41" meaning the VT420
@@ -1963,6 +2019,42 @@ public final class TerminalEmulator {
                 parseArg(b);
                 break;
         }
+    }
+
+    /** Process bytes while in the {@link #ESC_CSI_KITTY_POP} escape state. */
+    private void doCsiKittyPop(int b) {
+        if (b == 'u') {
+            KittyKeyboardState kittyState = getActiveKittyKeyboardState();
+            int count = Math.min(Math.max(1, getArg0(1)), kittyState.stackSize);
+            while (count-- > 0) kittyState.flags = kittyState.stack[--kittyState.stackSize];
+            if (kittyState.stackSize == 0) kittyState.flags = 0;
+        } else {
+            parseArg(b);
+        }
+    }
+
+    /** Process bytes while in the {@link #ESC_CSI_KITTY_SET} escape state. */
+    private void doCsiKittySet(int b) {
+        if (b == 'u') {
+            KittyKeyboardState kittyState = getActiveKittyKeyboardState();
+            int flags = getArg0(0);
+            switch (getArg1(1)) {
+                case 2: kittyState.flags |= flags; break;
+                case 3: kittyState.flags &= ~flags; break;
+                default: kittyState.flags = flags; break;
+            }
+        } else {
+            parseArg(b);
+        }
+    }
+
+    /** Current kitty keyboard protocol flags, 0 when the application has not enabled them. */
+    public int getKittyKeyboardFlags() {
+        return getActiveKittyKeyboardState().flags;
+    }
+
+    private KittyKeyboardState getActiveKittyKeyboardState() {
+        return mScreen == mAltBuffer ? mAltKittyKeyboardState : mMainKittyKeyboardState;
     }
 
     private void startEscapeSequence() {
@@ -2306,9 +2398,11 @@ public final class TerminalEmulator {
             case '>': // "Esc [ >" -- start of a private parameter byte
                 continueSequence(ESC_CSI_BIGGERTHAN);
                 break;
-            case '<': // "Esc [ <" -- start of a private parameter byte
-            case '=': // "Esc [ =" -- start of a private parameter byte
-                continueSequence(ESC_CSI_UNSUPPORTED_PARAMETER_BYTE);
+            case '<': // "Esc [ <" -- start of a private parameter byte, or kitty keyboard pop.
+                continueSequence(ESC_CSI_KITTY_POP);
+                break;
+            case '=': // "Esc [ =" -- start of a private parameter byte, or kitty keyboard set.
+                continueSequence(ESC_CSI_KITTY_SET);
                 break;
             case '`': // Horizontal position absolute (HPA - http://www.vt100.net/docs/vt510-rm/HPA).
                 setCursorColRespectingOriginMode(getArg0(1) - 1);
@@ -2477,6 +2571,7 @@ public final class TerminalEmulator {
             if (code == 0) { // reset
                 mForeColor = TextStyle.COLOR_INDEX_FOREGROUND;
                 mBackColor = TextStyle.COLOR_INDEX_BACKGROUND;
+                mUnderlineColor = -1;
                 mEffect = 0;
             } else if (code == 1) {
                 mEffect |= TextStyle.CHARACTER_ATTRIBUTE_BOLD;
@@ -2485,18 +2580,22 @@ public final class TerminalEmulator {
             } else if (code == 3) {
                 mEffect |= TextStyle.CHARACTER_ATTRIBUTE_ITALIC;
             } else if (code == 4) {
+                int underlineStyle = TextStyle.UNDERLINE_STYLE_SINGLE;
                 if (i + 1 <= mArgIndex && ((mArgsSubParamsBitSet & (1 << (i + 1))) != 0)) {
                     // Sub parameter, see https://sw.kovidgoyal.net/kitty/underlines/
                     i++;
-                    if (mArgs[i] == 0) {
-                        // No underline.
-                        mEffect &= ~TextStyle.CHARACTER_ATTRIBUTE_UNDERLINE;
-                    } else {
-                        // Different variations of underlines: https://sw.kovidgoyal.net/kitty/underlines/
-                        mEffect |= TextStyle.CHARACTER_ATTRIBUTE_UNDERLINE;
-                    }
+                    underlineStyle = mArgs[i];
+                }
+                if (underlineStyle == 0) {
+                    // No underline.
+                    mEffect &= ~TextStyle.CHARACTER_ATTRIBUTE_UNDERLINE;
+                    mEffect = (int) TextStyle.encodeUnderlineStyle(mEffect, TextStyle.UNDERLINE_STYLE_NONE);
                 } else {
+                    // Different variations of underlines: https://sw.kovidgoyal.net/kitty/underlines/
                     mEffect |= TextStyle.CHARACTER_ATTRIBUTE_UNDERLINE;
+                    if (underlineStyle < TextStyle.UNDERLINE_STYLE_SINGLE || underlineStyle > TextStyle.UNDERLINE_STYLE_DASHED)
+                        underlineStyle = TextStyle.UNDERLINE_STYLE_SINGLE;
+                    mEffect = (int) TextStyle.encodeUnderlineStyle(mEffect, underlineStyle);
                 }
             } else if (code == 5) {
                 mEffect |= TextStyle.CHARACTER_ATTRIBUTE_BLINK;
@@ -2516,6 +2615,7 @@ public final class TerminalEmulator {
                 mEffect &= ~TextStyle.CHARACTER_ATTRIBUTE_ITALIC;
             } else if (code == 24) { // underline: none
                 mEffect &= ~TextStyle.CHARACTER_ATTRIBUTE_UNDERLINE;
+                mEffect = (int) TextStyle.encodeUnderlineStyle(mEffect, TextStyle.UNDERLINE_STYLE_NONE);
             } else if (code == 25) { // blink: none
                 mEffect &= ~TextStyle.CHARACTER_ATTRIBUTE_BLINK;
             } else if (code == 27) { // image: positive
@@ -2529,16 +2629,31 @@ public final class TerminalEmulator {
             } else if (code == 38 || code == 48 || code == 58) {
                 // Extended set foreground(38)/background(48)/underline(58) color.
                 // This is followed by either "2;$R;$G;$B" to set a 24-bit color or
-                // "5;$INDEX" to set an indexed color.
+                // "5;$INDEX" to set an indexed color. The colon form (38:2::R:G:B) is also
+                // accepted, with an optional color space field before the RGB components.
+                boolean colonForm = (mArgsSubParamsBitSet & (1 << (i + 1))) != 0;
                 if (i + 2 > mArgIndex) continue;
                 int firstArg = mArgs[i + 1];
                 if (firstArg == 2) {
-                    if (i + 4 > mArgIndex) {
+                    int redIndex = i + 2;
+                    if (colonForm) {
+                        // Colon form may include an optional color space field before RGB:
+                        // 38:2::R:G:B (empty sRGB) or 38:2:0:R:G:B. Without it there are only
+                        // three values after the "2".
+                        int paramEnd = i + 1;
+                        while (paramEnd + 1 <= mArgIndex
+                            && (mArgsSubParamsBitSet & (1 << (paramEnd + 1))) != 0) paramEnd++;
+                        int valueCount = paramEnd - (i + 1);
+                        int firstValue = getArg(i + 2, -1, false);
+                        if (firstValue < 0 || (firstValue == 0 && valueCount == 4)) redIndex++;
+                    }
+                    int lastIndex = redIndex + 2;
+                    if (lastIndex > mArgIndex) {
                         Logger.logWarn(mClient, LOG_TAG, "Too few CSI" + code + ";2 RGB arguments");
                     } else {
-                        int red = getArg(i + 2, 0, false);
-                        int green = getArg(i + 3, 0, false);
-                        int blue = getArg(i + 4, 0, false);
+                        int red = getArg(redIndex, 0, false);
+                        int green = getArg(redIndex + 1, 0, false);
+                        int blue = getArg(redIndex + 2, 0, false);
 
                         if (red < 0 || green < 0 || blue < 0 || red > 255 || green > 255 || blue > 255) {
                             finishSequenceAndLogError("Invalid RGB: " + red + "," + green + "," + blue);
@@ -2550,7 +2665,7 @@ public final class TerminalEmulator {
                                 case 58: mUnderlineColor = argbColor; break;
                             }
                         }
-                        i += 4; // "2;P_r;P_g;P_r"
+                        i = lastIndex; // "2;P_r;P_g;P_b"
                     }
                 } else if (firstArg == 5) {
                     int color = getArg(i + 2, 0, false);
@@ -2574,7 +2689,7 @@ public final class TerminalEmulator {
             } else if (code == 49) { // Set default background color.
                 mBackColor = TextStyle.COLOR_INDEX_BACKGROUND;
             } else if (code == 59) { // Set default underline color.
-                mUnderlineColor = TextStyle.COLOR_INDEX_FOREGROUND;
+                mUnderlineColor = -1;
             } else if (code >= 90 && code <= 97) { // Bright foreground colors (aixterm codes).
                 mForeColor = code - 90 + 8;
             } else if (code >= 100 && code <= 107) { // Bright background color (aixterm codes).
@@ -2815,6 +2930,65 @@ public final class TerminalEmulator {
                     if (endOfInput) break;
                 }
                 break;
+            case 7: // Report current working directory: OSC 7 ; file://host/path ST
+                int schemeEnd = textParameter.indexOf("://");
+                int pathStart = schemeEnd < 0 ? -1 : textParameter.indexOf('/', schemeEnd + 3);
+                if (pathStart >= 0) {
+                    mCurrentWorkingDirectory = percentDecode(textParameter.substring(pathStart));
+                }
+                break;
+            case 9: // Growl-style notification, or OSC 9;4 progress (ConEmu/Windows Terminal).
+                if (textParameter.startsWith("4;")) {
+                    int stateEnd = textParameter.indexOf(';', 2);
+                    int state = parseIntOr(textParameter.substring(2, stateEnd < 0 ? textParameter.length() : stateEnd), -1);
+                    int progress = stateEnd < 0 ? -1 : parseIntOr(textParameter.substring(stateEnd + 1), -1);
+                    mProgressState = state;
+                    mProgressValue = state == 0 ? -1 : (progress < 0 ? -1 : Math.max(0, Math.min(100, progress)));
+                    mClient.onTerminalProgress(state, mProgressValue);
+                } else if (!textParameter.isEmpty()) {
+                    mClient.onTerminalNotification(null, textParameter);
+                }
+                break;
+            case 99: // Kitty desktop notification: OSC 99 ; metadata ; payload ST
+                int payloadSeparator = textParameter.indexOf(';');
+                String body = payloadSeparator < 0 ? "" : textParameter.substring(payloadSeparator + 1);
+                if (!body.isEmpty()) mClient.onTerminalNotification(null, body);
+                break;
+            case 777: // urxvt notification: OSC 777 ; notify ; title ; body ST
+                String[] notificationParts = textParameter.split(";", 3);
+                if (notificationParts.length >= 2) {
+                    String notificationTitle = notificationParts.length == 3 ? notificationParts[1] : null;
+                    String notificationBody = notificationParts.length == 3 ? notificationParts[2] : notificationParts[1];
+                    if (!notificationBody.isEmpty())
+                        mClient.onTerminalNotification(notificationTitle, notificationBody);
+                }
+                break;
+            case 133: // Shell integration: prompt marks, see https://gitlab.freedesktop.org/Per_Bothner/specifications
+                if (textParameter.startsWith("A") && mScreen == mMainBuffer) {
+                    long promptLine = mScreen.getTotalLinesScrolled() + mCursorRow;
+                    if (mPromptLines.isEmpty() || mPromptLines.get(mPromptLines.size() - 1) != promptLine) {
+                        mPromptLines.add(promptLine);
+                        if (mPromptLines.size() > MAX_PROMPT_LINES) mPromptLines.remove(0);
+                    }
+                }
+                break;
+            case 8: // Hyperlink. Format: ESC ] 8 ; params ; URI ST, with an empty URI to close it.
+                int separator = textParameter.indexOf(';');
+                if (separator >= 0) {
+                    String uri = textParameter.substring(separator + 1);
+                    if (uri.isEmpty()) {
+                        mHyperlinkId = 0;
+                    } else {
+                        Integer hyperlinkId = mHyperlinkIds.get(uri);
+                        if (hyperlinkId == null && mHyperlinks.size() < MAX_HYPERLINKS) {
+                            mHyperlinks.add(uri);
+                            hyperlinkId = mHyperlinks.size();
+                            mHyperlinkIds.put(uri, hyperlinkId);
+                        }
+                        if (hyperlinkId != null) mHyperlinkId = hyperlinkId;
+                    }
+                }
+                break;
             case 10: // Set foreground color.
             case 11: // Set background color.
             case 12: // Set cursor color.
@@ -3024,6 +3198,94 @@ public final class TerminalEmulator {
 
     private long getStyle() {
         return TextStyle.encode(mForeColor, mBackColor, mEffect);
+    }
+
+    private long getExtraStyle() {
+        return TextStyle.encodeExtra(mUnderlineColor, mHyperlinkId);
+    }
+
+    private static int parseIntOr(String value, int fallback) {
+        try {
+            return Integer.parseInt(value);
+        } catch (NumberFormatException e) {
+            return fallback;
+        }
+    }
+
+    private static String percentDecode(String value) {
+        if (value.indexOf('%') < 0) return value;
+        StringBuilder result = new StringBuilder(value.length());
+        for (int i = 0; i < value.length(); i++) {
+            char c = value.charAt(i);
+            if (c == '%' && i + 2 < value.length()) {
+                try {
+                    result.append((char) Integer.parseInt(value.substring(i + 1, i + 3), 16));
+                    i += 2;
+                    continue;
+                } catch (NumberFormatException ignored) {
+                    // Not a valid escape, keep the literal percent.
+                }
+            }
+            result.append(c);
+        }
+        return result.toString();
+    }
+
+    /** Last directory reported with OSC 7, or null. */
+    public String getCurrentWorkingDirectory() {
+        return mCurrentWorkingDirectory;
+    }
+
+    /** OSC 9;4 progress state (0 clear, 1 normal, 2 error, 3 indeterminate, 4 paused) or -1. */
+    public int getProgressState() {
+        return mProgressState;
+    }
+
+    /** OSC 9;4 progress percentage (0-100) or -1. */
+    public int getProgressValue() {
+        return mProgressValue;
+    }
+
+    /**
+     * Find the external row of the nearest OSC 133 prompt start.
+     *
+     * @param previous true for the previous prompt, false for the next one.
+     * @return the external row, or {@link Integer#MIN_VALUE} if there is none.
+     */
+    public int getPromptExternalRow(boolean previous) {
+        long currentLine = mScreen.getTotalLinesScrolled() + mCursorRow;
+        long best = Long.MIN_VALUE;
+        for (Long line : mPromptLines) {
+            if (previous ? line < currentLine : line > currentLine) {
+                if (best == Long.MIN_VALUE || (previous ? line > best : line < best)) best = line;
+            }
+        }
+        if (best == Long.MIN_VALUE) return Integer.MIN_VALUE;
+        int externalRow = (int) (best - mScreen.getTotalLinesScrolled());
+        if (externalRow < -mScreen.getActiveTranscriptRows() || externalRow >= mRows)
+            return Integer.MIN_VALUE;
+        return externalRow;
+    }
+
+    /** Resolve an OSC 8 hyperlink id to its URI, or null if unknown. */
+    public String getHyperlinkUri(int hyperlinkId) {
+        if (hyperlinkId <= 0 || hyperlinkId > mHyperlinks.size()) return null;
+        return mHyperlinks.get(hyperlinkId - 1);
+    }
+
+    /** The OSC 8 hyperlink id at a screen position, or 0. */
+    public int getHyperlinkIdAt(int row, int column) {
+        return TextStyle.decodeHyperlinkId(mScreen.getExtraStyleAt(row, column));
+    }
+
+    /** The OSC 8 hyperlink URI at a screen position, or null. */
+    public String getHyperlinkUriAt(int row, int column) {
+        return getHyperlinkUri(getHyperlinkIdAt(row, column));
+    }
+
+    /** Whether DECSET 2026 synchronized output is active. */
+    public boolean isSynchronizedOutput() {
+        return isDecsetInternalBitSet(DECSET_BIT_SYNCHRONIZED_OUTPUT);
     }
 
     /** "CSI P_m h" for set or "CSI P_m l" for reset ANSI mode. */
@@ -3425,7 +3687,8 @@ public final class TerminalEmulator {
         // so was mCursorCol changed after the offsetDueToCombiningChar conditional by another thread?
         // TODO: Check if there are thread synchronization issues with mCursorCol and mCursorRow, possibly causing others bugs too.
         if (column < 0) column = 0;
-        mScreen.setChar(column, mCursorRow, codePoint, getStyle());
+        mScreen.setChar(column, mCursorRow, codePoint, getStyle(), getExtraStyle());
+
 
         if (autoWrap && displayWidth > 0)
             mAboutToAutoWrap = (mCursorCol == mRightMargin - displayWidth);
@@ -3495,6 +3758,18 @@ public final class TerminalEmulator {
         mAboutToAutoWrap = false;
         mForeColor = mSavedStateMain.mSavedForeColor = mSavedStateAlt.mSavedForeColor = TextStyle.COLOR_INDEX_FOREGROUND;
         mBackColor = mSavedStateMain.mSavedBackColor = mSavedStateAlt.mSavedBackColor = TextStyle.COLOR_INDEX_BACKGROUND;
+        mUnderlineColor = -1;
+        mEffect = 0;
+        mHyperlinkId = 0;
+        mHyperlinkIds.clear();
+        mHyperlinks.clear();
+        mPromptLines.clear();
+        mProgressState = -1;
+        mProgressValue = -1;
+        mMainKittyKeyboardState.flags = 0;
+        mMainKittyKeyboardState.stackSize = 0;
+        mAltKittyKeyboardState.flags = 0;
+        mAltKittyKeyboardState.stackSize = 0;
         setDefaultTabStops();
 
         mUseLineDrawingG0 = mUseLineDrawingG1 = false;

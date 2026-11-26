@@ -5,7 +5,9 @@
 # Built application files
 build/
 release/
+/dist/
 *.apk
+*.aab
 *.so
 .externalNativeBuild
 .cxx
@@ -16,17 +18,28 @@ local.properties
 
 # Gradle generated files
 .gradle/
+.kotlin/
 
 # Signing files
 .signing/
+*.jks
+*.keystore
+*.p12
 
-# Intellij
+# Intellij / Android Studio
 .idea/
 *.iml
+.vscode/
+.fleet/
 
-# Vim
+# Crash / VM dumps
+*.hprof
+*.log
+
+# Vim / Emacs
 *.swo
 *.swp
+*~
 
 # OS-specific files
 .DS_Store

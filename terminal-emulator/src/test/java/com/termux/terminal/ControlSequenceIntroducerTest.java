@@ -98,20 +98,49 @@ public class ControlSequenceIntroducerTest extends TerminalTestCase {
      *  <ESC>[24m   # no underline (for backwards compat)
      * </pre>
      * <p>
-     * We currently parse the variants, but map them to normal/no underlines as appropriate
+     * The styles are stored in dedicated effect bits and reported by
+     * {@link TextStyle#decodeUnderlineStyle(long)}.
      */
     public void testUnderlineVariants() {
         for (String suffix : List.of("", ":1", ":2", ":3", ":4", ":5")) {
+            int expectedStyle;
+            switch (suffix) {
+                case ":2": expectedStyle = TextStyle.UNDERLINE_STYLE_DOUBLE; break;
+                case ":3": expectedStyle = TextStyle.UNDERLINE_STYLE_CURLY; break;
+                case ":4": expectedStyle = TextStyle.UNDERLINE_STYLE_DOTTED; break;
+                case ":5": expectedStyle = TextStyle.UNDERLINE_STYLE_DASHED; break;
+                default: expectedStyle = TextStyle.UNDERLINE_STYLE_SINGLE; break;
+            }
             for (String stop : List.of("24", "4:0")) {
                 withTerminalSized(3, 3);
                 enterString("\033[4" + suffix + "m").assertLinesAre("   ", "   ", "   ");
-                assertEquals(TextStyle.CHARACTER_ATTRIBUTE_UNDERLINE, mTerminal.mEffect);
+                assertEquals(TextStyle.CHARACTER_ATTRIBUTE_UNDERLINE, TextStyle.decodeEffect(mTerminal.mEffect));
+                assertEquals(expectedStyle, TextStyle.decodeUnderlineStyle(mTerminal.mEffect));
                 enterString("\033[4;1m").assertLinesAre("   ", "   ", "   ");
-                assertEquals(TextStyle.CHARACTER_ATTRIBUTE_BOLD | TextStyle.CHARACTER_ATTRIBUTE_UNDERLINE, mTerminal.mEffect);
+                assertEquals(TextStyle.CHARACTER_ATTRIBUTE_BOLD | TextStyle.CHARACTER_ATTRIBUTE_UNDERLINE,
+                    TextStyle.decodeEffect(mTerminal.mEffect));
                 enterString("\033[" + stop + "m").assertLinesAre("   ", "   ", "   ");
-                assertEquals(TextStyle.CHARACTER_ATTRIBUTE_BOLD, mTerminal.mEffect);
+                assertEquals(TextStyle.CHARACTER_ATTRIBUTE_BOLD, TextStyle.decodeEffect(mTerminal.mEffect));
+                assertEquals(TextStyle.UNDERLINE_STYLE_NONE, TextStyle.decodeUnderlineStyle(mTerminal.mEffect));
             }
         }
+    }
+
+    public void testUnderlineColors() {
+        withTerminalSized(4, 2);
+        enterString("\033[4:3;58:2::255:0:0m");
+        assertEquals(0xffff0000, mTerminal.mUnderlineColor);
+        enterString("X");
+        assertEquals(0xffff0000, TextStyle.decodeUnderlineColor(mTerminal.getScreen().getExtraStyleAt(0, 0)));
+
+        enterString("\033[4;58;5;196m");
+        assertEquals(196, mTerminal.mUnderlineColor);
+        enterString("Y");
+        assertEquals(196, TextStyle.decodeUnderlineColor(mTerminal.getScreen().getExtraStyleAt(0, 1)));
+
+        // Plain semicolon RGB form.
+        enterString("\033[58;2;0;255;0mZ");
+        assertEquals(0xff00ff00, TextStyle.decodeUnderlineColor(mTerminal.getScreen().getExtraStyleAt(0, 2)));
     }
 
     public void testManyParameters() {
@@ -125,7 +154,8 @@ public class ControlSequenceIntroducerTest extends TerminalTestCase {
         withTerminalSized(3, 3)
             .enterString(b.toString())
             .assertLinesAre("   ", "   ", "   ");
-        assertEquals(TextStyle.CHARACTER_ATTRIBUTE_UNDERLINE, mTerminal.mEffect);
+        assertEquals(TextStyle.CHARACTER_ATTRIBUTE_UNDERLINE, TextStyle.decodeEffect(mTerminal.mEffect));
+        assertTrue(TextStyle.decodeUnderlineStyle(mTerminal.mEffect) != TextStyle.UNDERLINE_STYLE_NONE);
     }
 
 }

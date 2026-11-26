@@ -10,6 +10,8 @@ import android.view.ViewGroup.LayoutParams;
 import android.widget.EditText;
 import android.widget.LinearLayout;
 
+import com.termux.shared.view.ViewUtils;
+
 public final class TextInputDialogUtils {
 
     public interface TextSetListener {
@@ -67,6 +69,7 @@ public final class TextInputDialogUtils {
         dialogHolder[0] = builder.create();
         dialogHolder[0].setCanceledOnTouchOutside(false);
         dialogHolder[0].show();
+        ViewUtils.applyOverrideTypeface(dialogHolder[0]);
     }
 
 }

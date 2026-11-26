@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Invisible touch catcher for the collapsed floating terminal. The handle itself is drawn by
+     the sheet window (which stays on screen at peek height with a transparent panel), so this
+     window only narrows the area that accepts the open gesture to 132 x 28dp. Keeping it fully
+     transparent avoids drawing the grip twice during the collapse/expand transitions. -->
+<View xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/overlay_handle_touch_area"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent" />

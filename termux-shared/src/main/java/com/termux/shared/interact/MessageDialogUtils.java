@@ -12,6 +12,7 @@ import android.widget.TextView;
 
 import com.termux.shared.R;
 import com.termux.shared.logger.Logger;
+import com.termux.shared.view.ViewUtils;
 
 public class MessageDialogUtils {
 
@@ -90,6 +91,7 @@ public class MessageDialogUtils {
         });
 
         dialog.show();
+        ViewUtils.applyOverrideTypeface(dialog);
     }
 
     public static void exitAppWithErrorMessage(Context context, String titleText, String messageText) {

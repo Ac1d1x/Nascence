@@ -37,6 +37,15 @@ public class TermuxDocumentsProvider extends DocumentsProvider {
 
     private static final File BASE_DIR = TermuxConstants.TERMUX_HOME_DIR;
 
+    /**
+     * Stable id for the exposed root.
+     *
+     * This used to be the absolute path of $HOME. Bumping it to a namespaced constant makes the
+     * system file picker treat it as a new root, so entries cached under the old Termux branding
+     * are replaced by the current app name instead of keeping a stale label.
+     */
+    private static final String ROOT_ID = "nascence_home";
+
 
     // The default columns to return information about a root if no specific
     // columns are requested in a query.
@@ -68,7 +77,7 @@ public class TermuxDocumentsProvider extends DocumentsProvider {
         final String applicationName = getContext().getString(R.string.application_name);
 
         final MatrixCursor.RowBuilder row = result.newRow();
-        row.add(Root.COLUMN_ROOT_ID, getDocIdForFile(BASE_DIR));
+        row.add(Root.COLUMN_ROOT_ID, ROOT_ID);
         row.add(Root.COLUMN_DOCUMENT_ID, getDocIdForFile(BASE_DIR));
         row.add(Root.COLUMN_SUMMARY, null);
         row.add(Root.COLUMN_FLAGS, Root.FLAG_SUPPORTS_CREATE | Root.FLAG_SUPPORTS_SEARCH | Root.FLAG_SUPPORTS_IS_CHILD);
@@ -155,7 +164,7 @@ public class TermuxDocumentsProvider extends DocumentsProvider {
     @Override
     public Cursor querySearchDocuments(String rootId, String query, String[] projection) throws FileNotFoundException {
         final MatrixCursor result = new MatrixCursor(projection != null ? projection : DEFAULT_DOCUMENT_PROJECTION);
-        final File parent = getFileForDocId(rootId);
+        final File parent = ROOT_ID.equals(rootId) ? BASE_DIR : getFileForDocId(rootId);
 
         // This example implementation searches file names for the query and doesn't rank search
         // results, so we can stop as soon as we find a sufficient number of matches.  Other
@@ -251,7 +260,10 @@ public class TermuxDocumentsProvider extends DocumentsProvider {
         }
         if (file.getParentFile().canWrite()) flags |= Document.FLAG_SUPPORTS_DELETE;
 
-        final String displayName = file.getName();
+        // Name the $HOME root after the app instead of the "home" directory name, so file managers
+        // that label a provider root by its document name do not show a leftover "Termux home".
+        final String displayName = file.equals(BASE_DIR)
+            ? getContext().getString(R.string.application_name) : file.getName();
         final String mimeType = getMimeType(file);
         if (mimeType.startsWith("image/")) flags |= Document.FLAG_SUPPORTS_THUMBNAIL;
 

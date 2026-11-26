@@ -1,15 +1,19 @@
 package com.termux.shared.view;
 
 import android.app.Activity;
+import android.app.Dialog;
 import android.content.Context;
 import android.content.ContextWrapper;
 import android.content.res.Configuration;
 import android.graphics.Point;
 import android.graphics.Rect;
+import android.graphics.Typeface;
 import android.os.Build;
 import android.util.TypedValue;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.Window;
+import android.widget.TextView;
 
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
@@ -24,6 +28,54 @@ public class ViewUtils {
     public static boolean VIEW_UTILS_LOGGING_ENABLED = false;
 
     private static final String LOG_TAG = "ViewUtils";
+
+    /** Optional app-wide typeface override applied to text views and dialogs. */
+    @Nullable private static Typeface sOverrideTypeface;
+    @Nullable private static Typeface sOverrideBoldTypeface;
+
+    /**
+     * Set the typeface used by {@link #applyOverrideTypeface(View)} and
+     * {@link #applyOverrideTypeface(Dialog)}. Pass {@code null} to disable overriding.
+     */
+    public static void setOverrideTypeface(@Nullable Typeface regular, @Nullable Typeface bold) {
+        sOverrideTypeface = regular;
+        sOverrideBoldTypeface = bold != null ? bold : regular;
+    }
+
+    /**
+     * Apply the override typeface to every {@link TextView} below {@code root}, preserving each
+     * view's bold style. This is a no-op if no override typeface has been set.
+     */
+    public static void applyOverrideTypeface(@Nullable View root) {
+        Typeface regular = sOverrideTypeface;
+        if (regular == null || root == null) return;
+        applyOverrideTypeface(root, regular, sOverrideBoldTypeface != null ? sOverrideBoldTypeface : regular);
+    }
+
+    /** Apply the override typeface to a dialog's window content. */
+    public static void applyOverrideTypeface(@Nullable Dialog dialog) {
+        if (dialog == null || sOverrideTypeface == null) return;
+        Window window = dialog.getWindow();
+        if (window != null) applyOverrideTypeface(window.getDecorView());
+    }
+
+    private static void applyOverrideTypeface(@NonNull View view, @NonNull Typeface regular,
+                                              @NonNull Typeface bold) {
+        if (view instanceof TextView) {
+            TextView textView = (TextView) view;
+            Typeface current = textView.getTypeface();
+            int style = current != null ? current.getStyle() : Typeface.NORMAL;
+            Typeface typeface = (style & Typeface.BOLD) != 0 ? bold : regular;
+            if (current != typeface) textView.setTypeface(typeface, style);
+        }
+
+        if (view instanceof ViewGroup) {
+            ViewGroup group = (ViewGroup) view;
+            for (int i = 0; i < group.getChildCount(); i++) {
+                applyOverrideTypeface(group.getChildAt(i), regular, bold);
+            }
+        }
+    }
 
     /**
      * Sets whether view utils logging is enabled or not.

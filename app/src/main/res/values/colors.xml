@@ -1,3 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
+    <color name="ic_launcher_background">#2C314E</color>
+    <color name="notification_accent">#3F6BFF</color>
+
+    <!-- Left drawer: translucent backgrounds, no elevation shadow. -->
+    <color name="drawer_background_translucent_light">#D9FFFFFF</color>
+    <color name="drawer_background_translucent_dark">#D9000000</color>
 </resources>

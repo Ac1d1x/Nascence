@@ -2,7 +2,7 @@
 
 <!DOCTYPE resources [
     <!ENTITY TERMUX_PACKAGE_NAME "com.termux">
-    <!ENTITY TERMUX_APP_NAME "Termux">
+    <!ENTITY TERMUX_APP_NAME "Nascence">
     <!ENTITY TERMUX_API_APP_NAME "Termux:API">
     <!ENTITY TERMUX_BOOT_APP_NAME "Termux:Boot">
     <!ENTITY TERMUX_FLOAT_APP_NAME "Termux:Float">
@@ -80,6 +80,7 @@
     <string name="msg_terminal_reset">Terminal reset</string>
 
     <string name="action_kill_process">Kill process (%d)</string>
+    <string name="action_close_session">Close session</string>
     <string name="title_confirm_kill_process">Really kill this session?</string>
 
     <string name="action_style_terminal">Style</string>
@@ -100,6 +101,20 @@
     <string name="notification_action_exit">Exit</string>
     <string name="notification_action_wake_lock">Acquire wakelock</string>
     <string name="notification_action_wake_unlock">Release wakelock</string>
+    <string name="notification_channel_name">&TERMUX_APP_NAME; session status</string>
+    <string name="notification_channel_description">Keeps terminal sessions and background tasks alive while &TERMUX_APP_NAME; is in the background.</string>
+    <plurals name="notification_session_count">
+        <item quantity="one">%d session</item>
+        <item quantity="other">%d sessions</item>
+    </plurals>
+    <plurals name="notification_task_count">
+        <item quantity="one">%d background task</item>
+        <item quantity="other">%d background tasks</item>
+    </plurals>
+    <string name="notification_wakelock_held">wake lock held</string>
+    <string name="notification_idle">idle</string>
+    <string name="notification_unnamed_session">Shell</string>
+    <string name="notification_more_sessions">…and %1$d more</string>
 
 
 
@@ -234,5 +249,28 @@
 
     <!-- Donate Preference -->
     <string name="donate_preference_title">Donate</string>
+
+    <!-- Scrollback Search -->
+    <string name="action_search">Search scrollback</string>
+    <string name="action_theme">Color theme</string>
+    <string name="theme_follow_colors">Follow ~/.termux/colors.properties</string>
+    <string name="terminal_notification_channel_name">Terminal notifications</string>
+    <string name="terminal_notification_channel_description">Notifications sent by programs running in the terminal</string>
+    <string name="search_hint">Search scrollback…</string>
+    <string name="action_search_previous">Previous match</string>
+    <string name="action_search_next">Next match</string>
+    <string name="action_search_close">Close search</string>
+    <string name="action_scroll_to_bottom">Scroll to bottom</string>
+
+    <!-- Floating overlay terminal -->
+    <string name="overlay_terminal_title">Floating terminal</string>
+    <string name="overlay_session_name">Floating terminal</string>
+    <string name="overlay_resize">Drag up to collapse, drag down to expand</string>
+    <string name="overlay_action_show">Floating terminal</string>
+    <string name="overlay_action_hide">Hide floating terminal</string>
+    <string name="overlay_permission_needed">Grant “Display over other apps” to use the floating terminal</string>
+    <string name="overlay_session_exited">Floating terminal session ended</string>
+    <string name="overlay_window_failed">Could not show the floating terminal</string>
+    <string name="overlay_notification_running">Floating terminal</string>
 
 </resources>

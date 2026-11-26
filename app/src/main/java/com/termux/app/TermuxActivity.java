@@ -9,9 +9,13 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.ServiceConnection;
+import android.graphics.Color;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.IBinder;
+import android.text.Editable;
+import android.text.TextWatcher;
 import android.view.ContextMenu;
 import android.view.ContextMenu.ContextMenuInfo;
 import android.view.Gravity;
@@ -20,15 +24,19 @@ import android.view.MenuItem;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.WindowManager;
+import android.view.animation.AccelerateInterpolator;
+import android.view.animation.DecelerateInterpolator;
 import android.widget.EditText;
 import android.widget.ImageButton;
 import android.widget.ListView;
 import android.widget.RelativeLayout;
+import android.widget.TextView;
 import android.widget.Toast;
 
 import com.termux.R;
 import com.termux.app.api.file.FileReceiverActivity;
 import com.termux.app.terminal.TermuxActivityRootView;
+import com.termux.app.terminal.TerminalThemeLibrary;
 import com.termux.app.terminal.TermuxTerminalSessionActivityClient;
 import com.termux.app.terminal.io.TermuxTerminalExtraKeys;
 import com.termux.shared.activities.ReportActivity;
@@ -53,6 +61,7 @@ import com.termux.shared.termux.TermuxUtils;
 import com.termux.shared.termux.settings.properties.TermuxAppSharedProperties;
 import com.termux.shared.termux.theme.TermuxThemeUtils;
 import com.termux.shared.theme.NightMode;
+import com.termux.shared.view.KeyboardUtils;
 import com.termux.shared.view.ViewUtils;
 import com.termux.terminal.TerminalSession;
 import com.termux.terminal.TerminalSessionClient;
@@ -62,6 +71,8 @@ import com.termux.view.TerminalViewClient;
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 import androidx.appcompat.app.AppCompatActivity;
+import androidx.core.view.WindowCompat;
+import androidx.core.view.WindowInsetsControllerCompat;
 import androidx.drawerlayout.widget.DrawerLayout;
 import androidx.viewpager.widget.ViewPager;
 
@@ -138,6 +149,9 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
      */
     TermuxSessionsListViewController mTermuxSessionListViewController;
 
+    /** True once the floating terminal was rolled up for the currently open drawer. */
+    private boolean mOverlayCollapsedForDrawer;
+
     /**
      * The {@link TermuxActivity} broadcast receiver for various things like terminal style configuration changes.
      */
@@ -175,6 +189,11 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
 
     private float mTerminalToolbarDefaultHeight;
 
+    /** Floating jump-to-bottom button and whether it is logically shown (target state). */
+    private View mScrollToBottomButton;
+    private boolean mScrollToBottomButtonVisible;
+
+    private static final int SCROLL_TO_BOTTOM_GAP_DP = 12;
 
     private static final int CONTEXT_MENU_SELECT_URL_ID = 0;
     private static final int CONTEXT_MENU_SHARE_TRANSCRIPT_ID = 1;
@@ -188,6 +207,8 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
     private static final int CONTEXT_MENU_HELP_ID = 7;
     private static final int CONTEXT_MENU_SETTINGS_ID = 8;
     private static final int CONTEXT_MENU_REPORT_ID = 9;
+    private static final int CONTEXT_MENU_SEARCH_ID = 12;
+    private static final int CONTEXT_MENU_THEME_ID = 13;
 
     private static final String ARG_TERMINAL_TOOLBAR_TEXT_INPUT = "terminal_toolbar_text_input";
     private static final String ARG_ACTIVITY_RECREATED = "activity_recreated";
@@ -214,6 +235,44 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
         super.onCreate(savedInstanceState);
 
         setContentView(R.layout.activity_termux);
+
+        // Draw edge-to-edge with fully transparent system bars so the wallpaper is continuous
+        // behind the status and navigation bars instead of being darkened by the system scrim.
+        WindowCompat.setDecorFitsSystemWindows(getWindow(), false);
+        getWindow().setStatusBarColor(Color.TRANSPARENT);
+        getWindow().setNavigationBarColor(Color.TRANSPARENT);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            getWindow().setStatusBarContrastEnforced(false);
+            getWindow().setNavigationBarContrastEnforced(false);
+            getWindow().setNavigationBarDividerColor(Color.TRANSPARENT);
+        }
+        WindowInsetsControllerCompat insetsController = WindowCompat.getInsetsController(getWindow(), getWindow().getDecorView());
+        if (insetsController != null) {
+            insetsController.setAppearanceLightStatusBars(false);
+            insetsController.setAppearanceLightNavigationBars(false);
+        }
+
+        // The drawer is translucent: drop its elevation shadow and the dimming scrim behind it.
+        getDrawer().setDrawerElevation(0f);
+        getDrawer().setScrimColor(Color.TRANSPARENT);
+
+        // A floating terminal window sits above the activity and would cover the top of the
+        // drawer, swallowing taps on the session list. Roll it up as soon as the drawer starts
+        // sliding in.
+        getDrawer().addDrawerListener(new DrawerLayout.SimpleDrawerListener() {
+            @Override
+            public void onDrawerSlide(View drawerView, float slideOffset) {
+                if (slideOffset > 0f && !mOverlayCollapsedForDrawer) {
+                    mOverlayCollapsedForDrawer = true;
+                    if (mTermuxService != null) mTermuxService.collapseOverlayForDrawer();
+                }
+            }
+
+            @Override
+            public void onDrawerClosed(View drawerView) {
+                mOverlayCollapsedForDrawer = false;
+            }
+        });
 
         // Load termux shared preferences
         // This will also fail if TermuxConstants.TERMUX_PACKAGE_NAME does not equal applicationId
@@ -250,6 +309,8 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
         setNewSessionButtonView();
 
         setToggleKeyboardView();
+
+        setSearchViews();
 
         registerForContextMenu(mTerminalView);
 
@@ -320,6 +381,22 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
         TermuxCrashUtils.notifyAppCrashFromCrashLogFile(this, LOG_TAG);
 
         mIsOnResumeAfterOnCreate = false;
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+
+        // The notification "New session" action reuses the launcher shortcut contract: an
+        // ACTION_RUN intent to this activity. Since the activity is singleTask, an already
+        // running instance receives it here rather than through onServiceConnected().
+        if (intent != null && Intent.ACTION_RUN.equals(intent.getAction())
+            && mTermuxService != null && mTermuxTerminalSessionActivityClient != null) {
+            boolean isFailSafe = intent.getBooleanExtra(TERMUX_ACTIVITY.EXTRA_FAILSAFE_SESSION, false);
+            mTermuxTerminalSessionActivityClient.addNewSession(isFailSafe, null);
+            setIntent(null);
+        }
     }
 
     @Override
@@ -525,6 +602,9 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
 
         terminalToolbarViewPager.setAdapter(new TerminalToolbarViewPager.PageAdapter(this, savedTextInput));
         terminalToolbarViewPager.addOnPageChangeListener(new TerminalToolbarViewPager.OnPageChangeListener(this, terminalToolbarViewPager));
+        terminalToolbarViewPager.addOnLayoutChangeListener((v, left, top, right, bottom,
+                                                            oldLeft, oldTop, oldRight, oldBottom) ->
+            updateScrollToBottomButtonPosition());
     }
 
     private void setTerminalToolbarHeight() {
@@ -536,6 +616,7 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
             (mTermuxTerminalExtraKeys.getExtraKeysInfo() == null ? 0 : mTermuxTerminalExtraKeys.getExtraKeysInfo().getMatrix().length) *
             mProperties.getTerminalToolbarHeightScaleFactor());
         terminalToolbarViewPager.setLayoutParams(layoutParams);
+        updateScrollToBottomButtonPosition();
     }
 
     public void toggleTerminalToolbar() {
@@ -545,6 +626,7 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
         final boolean showNow = mPreferences.toogleShowTerminalToolbar();
         Logger.showToast(this, (showNow ? getString(R.string.msg_enabling_terminal_toolbar) : getString(R.string.msg_disabling_terminal_toolbar)), true);
         terminalToolbarViewPager.setVisibility(showNow ? View.VISIBLE : View.GONE);
+        updateScrollToBottomButtonPosition();
         if (showNow && isTerminalToolbarTextInputViewSelected()) {
             // Focus the text input view if just revealed.
             findViewById(R.id.terminal_toolbar_text_input).requestFocus();
@@ -594,6 +676,193 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
         });
     }
 
+    private void setSearchViews() {
+        EditText input = findViewById(R.id.terminal_search_input);
+        TextView count = findViewById(R.id.terminal_search_count);
+
+        input.addTextChangedListener(new TextWatcher() {
+            @Override
+            public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
+
+            @Override
+            public void onTextChanged(CharSequence s, int start, int before, int count) {}
+
+            @Override
+            public void afterTextChanged(Editable s) {
+                updateSearchResults();
+            }
+        });
+
+        input.setOnEditorActionListener((v, actionId, event) -> {
+            mTerminalView.searchNext(true);
+            updateSearchCount();
+            return true;
+        });
+
+        findViewById(R.id.terminal_search_prev).setOnClickListener(v -> {
+            mTerminalView.searchNext(false);
+            updateSearchCount();
+        });
+        findViewById(R.id.terminal_search_next).setOnClickListener(v -> {
+            mTerminalView.searchNext(true);
+            updateSearchCount();
+        });
+        findViewById(R.id.terminal_search_close).setOnClickListener(v -> hideSearchBar());
+
+        mScrollToBottomButton = findViewById(R.id.terminal_scroll_to_bottom);
+        mScrollToBottomButton.setOnClickListener(v -> mTerminalView.setTopRow(0));
+        mTerminalView.setScrollListener(atBottom -> setScrollToBottomButtonVisible(!atBottom));
+        updateScrollToBottomButtonPosition();
+    }
+
+    private void setScrollToBottomButtonVisible(boolean visible) {
+        if (mScrollToBottomButton == null || mScrollToBottomButtonVisible == visible) return;
+        mScrollToBottomButtonVisible = visible;
+
+        final View button = mScrollToBottomButton;
+        final float density = getResources().getDisplayMetrics().density;
+        button.animate().cancel();
+
+        if (visible) {
+            button.setVisibility(View.VISIBLE);
+            button.setAlpha(0f);
+            button.setScaleX(0.72f);
+            button.setScaleY(0.72f);
+            button.setTranslationY(density * 10f);
+            button.animate()
+                .alpha(1f)
+                .scaleX(1f)
+                .scaleY(1f)
+                .translationY(0f)
+                .setDuration(190L)
+                .setInterpolator(new DecelerateInterpolator(1.6f))
+                .start();
+        } else {
+            button.animate()
+                .alpha(0f)
+                .scaleX(0.78f)
+                .scaleY(0.78f)
+                .translationY(density * 8f)
+                .setDuration(130L)
+                .setInterpolator(new AccelerateInterpolator())
+                .withEndAction(() -> {
+                    if (!mScrollToBottomButtonVisible) button.setVisibility(View.GONE);
+                })
+                .start();
+        }
+    }
+
+    /** Keep the jump-to-bottom button just above the extra keys bar, whose height is dynamic. */
+    private void updateScrollToBottomButtonPosition() {
+        View button = findViewById(R.id.terminal_scroll_to_bottom);
+        if (button == null) return;
+
+        ViewPager toolbarPager = getTerminalToolbarViewPager();
+        int toolbarHeight = 0;
+        if (toolbarPager != null && toolbarPager.getVisibility() == View.VISIBLE) {
+            toolbarHeight = toolbarPager.getHeight();
+            if (toolbarHeight <= 0 && toolbarPager.getLayoutParams() != null)
+                toolbarHeight = Math.max(0, toolbarPager.getLayoutParams().height);
+        }
+
+        int gap = Math.round(SCROLL_TO_BOTTOM_GAP_DP * getResources().getDisplayMetrics().density);
+        int bottomMargin = toolbarHeight + gap;
+
+        ViewGroup.MarginLayoutParams layoutParams = (ViewGroup.MarginLayoutParams) button.getLayoutParams();
+        if (layoutParams.bottomMargin != bottomMargin) {
+            layoutParams.bottomMargin = bottomMargin;
+            button.setLayoutParams(layoutParams);
+        }
+    }
+
+    private void showSearchBar() {
+        View bar = findViewById(R.id.terminal_search_bar);
+        bar.setVisibility(View.VISIBLE);
+        EditText input = findViewById(R.id.terminal_search_input);
+        input.requestFocus();
+        input.selectAll();
+        KeyboardUtils.showSoftKeyboard(this, input);
+    }
+
+    private void hideSearchBar() {
+        View bar = findViewById(R.id.terminal_search_bar);
+        bar.setVisibility(View.GONE);
+        EditText input = findViewById(R.id.terminal_search_input);
+        input.setText("");
+        mTerminalView.clearSearch();
+        KeyboardUtils.hideSoftKeyboard(this, input);
+    }
+
+    private void showThemePicker() {
+        final com.termux.terminal.TerminalSession session = getCurrentSession();
+        if (session == null || session.getEmulator() == null) return;
+        final com.termux.terminal.TerminalColors colors = session.getEmulator().mColors;
+        final int[] originalColors = colors.mCurrentColors.clone();
+
+        final java.util.List<TerminalThemeLibrary.Theme> themes = TerminalThemeLibrary.getThemes();
+        final String[] names = new String[themes.size() + 1];
+        names[0] = getString(R.string.theme_follow_colors);
+        String selectedId = TerminalThemeLibrary.getSelectedThemeId(this);
+        int selectedIndex = 0;
+        for (int i = 0; i < themes.size(); i++) {
+            names[i + 1] = themes.get(i).name;
+            if (themes.get(i).id.equals(selectedId)) selectedIndex = i + 1;
+        }
+        final int[] chosen = {selectedIndex};
+
+        AlertDialog dialog = new AlertDialog.Builder(this)
+            .setTitle(R.string.action_theme)
+            .setSingleChoiceItems(names, selectedIndex, (d, which) -> {
+                chosen[0] = which;
+                if (which == 0) {
+                    System.arraycopy(originalColors, 0, colors.mCurrentColors, 0, originalColors.length);
+                } else {
+                    TerminalThemeLibrary.apply(themes.get(which - 1), colors);
+                }
+                session.onColorsChanged();
+                mTerminalView.invalidate();
+                mTermuxTerminalSessionActivityClient.updateBackgroundColor();
+            })
+            .setPositiveButton(android.R.string.ok, (d, which) -> {
+                String id = chosen[0] == 0 ? "" : themes.get(chosen[0] - 1).id;
+                TerminalThemeLibrary.setSelectedThemeId(this, id);
+            })
+            .setNegativeButton(android.R.string.cancel, (d, which) -> {
+                System.arraycopy(originalColors, 0, colors.mCurrentColors, 0, originalColors.length);
+                session.onColorsChanged();
+                mTerminalView.invalidate();
+                mTermuxTerminalSessionActivityClient.updateBackgroundColor();
+            })
+            .create();
+        dialog.setOnCancelListener(d -> {
+            System.arraycopy(originalColors, 0, colors.mCurrentColors, 0, originalColors.length);
+            session.onColorsChanged();
+            mTerminalView.invalidate();
+            mTermuxTerminalSessionActivityClient.updateBackgroundColor();
+        });
+        dialog.show();
+    }
+
+    private boolean isSearchBarVisible() {
+        return findViewById(R.id.terminal_search_bar).getVisibility() == View.VISIBLE;
+    }
+
+    private void updateSearchResults() {
+        String query = ((EditText) findViewById(R.id.terminal_search_input)).getText().toString();
+        mTerminalView.setSearchQuery(query);
+        updateSearchCount();
+    }
+
+    private void updateSearchCount() {
+        TextView count = findViewById(R.id.terminal_search_count);
+        int total = mTerminalView.getSearchMatchCount();
+        if (total == 0) {
+            count.setText("");
+        } else {
+            count.setText((mTerminalView.getSearchCurrentMatch() + 1) + "/" + total);
+        }
+    }
+
 
 
 
@@ -601,7 +870,9 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
     @SuppressLint("RtlHardcoded")
     @Override
     public void onBackPressed() {
-        if (getDrawer().isDrawerOpen(Gravity.LEFT)) {
+        if (isSearchBarVisible()) {
+            hideSearchBar();
+        } else if (getDrawer().isDrawerOpen(Gravity.LEFT)) {
             getDrawer().closeDrawers();
         } else {
             finishActivityIfNotFinishing();
@@ -634,6 +905,8 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
         boolean autoFillEnabled = mTerminalView.isAutoFillEnabled();
 
         menu.add(Menu.NONE, CONTEXT_MENU_SELECT_URL_ID, Menu.NONE, R.string.action_select_url);
+        menu.add(Menu.NONE, CONTEXT_MENU_SEARCH_ID, Menu.NONE, R.string.action_search);
+        menu.add(Menu.NONE, CONTEXT_MENU_THEME_ID, Menu.NONE, R.string.action_theme);
         menu.add(Menu.NONE, CONTEXT_MENU_SHARE_TRANSCRIPT_ID, Menu.NONE, R.string.action_share_transcript);
         if (!DataUtils.isNullOrEmpty(mTerminalView.getStoredSelectedText()))
             menu.add(Menu.NONE, CONTEXT_MENU_SHARE_SELECTED_TEXT, Menu.NONE, R.string.action_share_selected_text);
@@ -664,6 +937,12 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
         switch (item.getItemId()) {
             case CONTEXT_MENU_SELECT_URL_ID:
                 mTermuxTerminalViewClient.showUrlSelection();
+                return true;
+            case CONTEXT_MENU_SEARCH_ID:
+                showSearchBar();
+                return true;
+            case CONTEXT_MENU_THEME_ID:
+                showThemePicker();
                 return true;
             case CONTEXT_MENU_SHARE_TRANSCRIPT_ID:
                 mTermuxTerminalViewClient.shareSessionTranscript();
@@ -721,7 +1000,7 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
             session.finishIfRunning();
         });
         b.setNegativeButton(android.R.string.no, null);
-        b.show();
+        ViewUtils.applyOverrideTypeface(b.show());
     }
 
     private void onResetTerminalSession(TerminalSession session) {
@@ -742,10 +1021,12 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
         } catch (ActivityNotFoundException | IllegalArgumentException e) {
             // The startActivity() call is not documented to throw IllegalArgumentException.
             // However, crash reporting shows that it sometimes does, so catch it here.
-            new AlertDialog.Builder(this).setMessage(getString(R.string.error_styling_not_installed))
+            AlertDialog dialog = new AlertDialog.Builder(this).setMessage(getString(R.string.error_styling_not_installed))
                 .setPositiveButton(R.string.action_styling_install,
-                    (dialog, which) -> ActivityUtils.startActivity(this, new Intent(Intent.ACTION_VIEW, Uri.parse(TermuxConstants.TERMUX_STYLING_FDROID_PACKAGE_URL))))
-                .setNegativeButton(android.R.string.cancel, null).show();
+                    (dialogInterface, which) -> ActivityUtils.startActivity(this, new Intent(Intent.ACTION_VIEW, Uri.parse(TermuxConstants.TERMUX_STYLING_FDROID_PACKAGE_URL))))
+                .setNegativeButton(android.R.string.cancel, null).create();
+            dialog.show();
+            ViewUtils.applyOverrideTypeface(dialog);
         }
     }
     private void toggleKeepScreenOn() {
