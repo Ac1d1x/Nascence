@@ -1303,8 +1303,10 @@ public final class TermuxOverlayManager {
                             // Fling up: roll the sheet all the way into the top handle.
                             target = peek;
                         } else if (velocityY > minFling) {
-                            // Fling down: inertia carries it to the largest allowed size.
+                            // Fling down: inertia carries it to the largest allowed size. A short,
+                            // fast downward pull also wakes the IME so it does not stay dismissed.
                             target = max;
+                            showKeyboard();
                         } else if (current <= collapseThreshold) {
                             target = peek;
                         } else {
