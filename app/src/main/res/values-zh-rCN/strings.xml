@@ -63,6 +63,7 @@
     <string name="action_toggle_keep_screen_on">保持屏幕常亮</string>
     <string name="action_open_help">帮助</string>
     <string name="action_open_settings">设置</string>
+    <string name="extra_keys_switch">小键盘开关</string>
 
     <string name="action_report_issue">报告问题</string>
     <string name="msg_generating_report">正在生成报告</string>

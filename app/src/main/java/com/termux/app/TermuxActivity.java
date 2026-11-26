@@ -9,6 +9,7 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.ServiceConnection;
+import android.content.SharedPreferences;
 import android.graphics.Color;
 import android.net.Uri;
 import android.os.Build;
@@ -28,6 +29,7 @@ import android.view.animation.AccelerateInterpolator;
 import android.view.animation.DecelerateInterpolator;
 import android.widget.EditText;
 import android.widget.ImageButton;
+import android.widget.CheckBox;
 import android.widget.ListView;
 import android.widget.RelativeLayout;
 import android.widget.TextView;
@@ -35,6 +37,7 @@ import android.widget.Toast;
 
 import com.termux.R;
 import com.termux.app.api.file.FileReceiverActivity;
+import com.termux.app.overlay.TermuxOverlayManager;
 import com.termux.app.terminal.TermuxActivityRootView;
 import com.termux.app.terminal.TerminalThemeLibrary;
 import com.termux.app.terminal.TermuxTerminalSessionActivityClient;
@@ -305,6 +308,7 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
         setTerminalToolbarView(savedInstanceState);
 
         setSettingsButtonView();
+        setExtraKeysSwitchView();
 
         setNewSessionButtonView();
 
@@ -650,6 +654,24 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
         settingsButton.setOnClickListener(v -> {
             ActivityUtils.startActivity(this, new Intent(this, SettingsActivity.class));
         });
+    }
+
+    /**
+     * Toggles the floating terminal's extra keys row (the small keyboard summoned by long-pressing
+     * the sheet handle). Persisted in the overlay preferences so the service sees it immediately.
+     */
+    private void setExtraKeysSwitchView() {
+        CheckBox switchView = findViewById(R.id.extra_keys_switch);
+        if (switchView == null) return;
+
+        SharedPreferences preferences = getSharedPreferences(
+            TermuxOverlayManager.PREFERENCES_NAME, MODE_PRIVATE);
+        switchView.setChecked(preferences.getBoolean(
+            TermuxOverlayManager.KEY_EXTRA_KEYS_ENABLED, true));
+        switchView.setOnCheckedChangeListener((buttonView, isChecked) ->
+            preferences.edit()
+                .putBoolean(TermuxOverlayManager.KEY_EXTRA_KEYS_ENABLED, isChecked)
+                .apply());
     }
 
     private void setNewSessionButtonView() {
