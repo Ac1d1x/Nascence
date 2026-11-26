@@ -1,0 +1,47 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Build debug APKs
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Use the release tag (v0.1.0 -> 0.1.0) as the APK versionName.
+          export TERMUX_APP_VERSION_NAME="${GITHUB_REF_NAME#v}"
+          ./gradlew assembleDebug
+
+      - name: Generate checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd app/build/outputs/apk/debug
+          sha256sum *.apk > "Nascence-${GITHUB_REF_NAME}-sha256sums.txt"
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Nascence ${{ github.ref_name }}
+          body: 首个发行版
+          files: |
+            app/build/outputs/apk/debug/*.apk
+            app/build/outputs/apk/debug/*-sha256sums.txt
+          fail_on_unmatched_files: true

@@ -7,6 +7,9 @@ on:
 
 jobs:
   attach-apks:
+    # The upstream release flow is not used by this fork; the Release workflow builds and uploads
+    # the APKs directly.
+    if: github.repository == 'termux/termux-app'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
