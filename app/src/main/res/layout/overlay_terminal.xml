@@ -31,6 +31,17 @@
 
     </FrameLayout>
 
+    <!-- Extra keys row, summoned by long-pressing the grab handle. It uses the same layout and
+         styling as the main app's terminal toolbar and sits just above the handle. -->
+    <com.termux.shared.termux.extrakeys.ExtraKeysView
+        android:id="@+id/overlay_extra_keys"
+        style="?android:attr/buttonBarStyle"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_gravity="bottom"
+        android:layout_marginBottom="28dp"
+        android:visibility="gone" />
+
     <!-- Grab handle pinned to the free (bottom) edge, like a bottom sheet's handle mirrored to the
          top of the screen. Dragging it up collapses the sheet, dragging it down expands it. -->
     <FrameLayout

@@ -2,6 +2,8 @@ package com.termux.app.overlay;
 
 import android.annotation.SuppressLint;
 import android.annotation.TargetApi;
+import android.animation.Animator;
+import android.animation.AnimatorListenerAdapter;
 import android.animation.ValueAnimator;
 import android.app.Dialog;
 import android.content.Context;
@@ -15,12 +17,14 @@ import android.os.Handler;
 import android.os.Looper;
 import android.view.ContextThemeWrapper;
 import android.view.Gravity;
+import android.view.HapticFeedbackConstants;
 import android.view.KeyEvent;
 import android.view.LayoutInflater;
 import android.view.MotionEvent;
 import android.view.VelocityTracker;
 import android.view.View;
 import android.view.ViewConfiguration;
+import android.view.ViewGroup;
 import android.view.Window;
 import android.view.WindowManager;
 import android.view.animation.DecelerateInterpolator;
@@ -43,12 +47,17 @@ import com.termux.shared.shell.command.ExecutionCommand;
 import com.termux.shared.shell.command.ExecutionCommand.Runner;
 import com.termux.shared.termux.TermuxConstants;
 import com.termux.shared.termux.data.TermuxUrlUtils;
+import com.termux.shared.termux.extrakeys.ExtraKeysConstants;
+import com.termux.shared.termux.extrakeys.ExtraKeysInfo;
+import com.termux.shared.termux.extrakeys.ExtraKeysView;
 import com.termux.shared.termux.settings.preferences.TermuxAppSharedPreferences;
 import com.termux.shared.termux.settings.properties.TermuxAppSharedProperties;
+import com.termux.shared.termux.settings.properties.TermuxPropertyConstants;
 import com.termux.shared.termux.shell.TermuxShellManager;
 import com.termux.shared.termux.shell.command.environment.TermuxShellEnvironment;
 import com.termux.shared.termux.shell.command.runner.terminal.TermuxSession;
 import com.termux.shared.termux.terminal.TermuxTerminalSessionClientBase;
+import com.termux.shared.termux.terminal.io.TerminalExtraKeys;
 import com.termux.terminal.TerminalColors;
 import com.termux.terminal.TerminalEmulator;
 import com.termux.terminal.TerminalSession;
@@ -57,6 +66,8 @@ import com.termux.view.TerminalView;
 
 import java.util.LinkedHashSet;
 import java.util.function.Consumer;
+
+import org.json.JSONException;
 
 /**
  * Owns the floating (overlay) terminal: its dedicated shell session, the top-anchored sheet, the
@@ -123,6 +134,17 @@ public final class TermuxOverlayManager {
     private WindowManager.LayoutParams mOverlayParams;
     @Nullable
     private ValueAnimator mHeightAnimator;
+
+    @Nullable
+    private ExtraKeysView mExtraKeysView;
+    @Nullable
+    private ValueAnimator mExtraKeysAnimator;
+    /** Whether the extra keys row is currently shown. */
+    private boolean mExtraKeysVisible;
+    /** Full height of the extra keys row in pixels. */
+    private int mExtraKeysHeight;
+    /** Height currently reserved from the terminal content for the extra keys row. */
+    private int mExtraKeysInset;
 
     private boolean mVisible;
     private boolean mCollapsed;
@@ -293,6 +315,8 @@ public final class TermuxOverlayManager {
         if (mTerminalView != null && mTerminalView.mRenderer != null)
             mTerminalView.setTypeface(AppTypeface.getRegular(mService), AppTypeface.getBold(mService));
         applyOverlayPalette();
+        // Pick up any extra-keys layout changes made in the app since the last summon.
+        reloadExtraKeys();
 
         // Start from the collapsed handle and animate down, so opening the sheet is animated too.
         mCollapsed = true;
@@ -432,6 +456,7 @@ public final class TermuxOverlayManager {
         cancelHeightAnimation();
         hideKeyboard();
         updateCursorBlinker(false);
+        hideExtraKeysImmediate();
         removeCollapsedHandle();
         if (mOverlayDialog != null) {
             try {
@@ -462,6 +487,7 @@ public final class TermuxOverlayManager {
         cancelHeightAnimation();
         hideKeyboard();
         updateCursorBlinker(false);
+        hideExtraKeysImmediate();
         removeCollapsedHandle();
         if (mOverlayDialog != null) {
             try {
@@ -472,6 +498,7 @@ public final class TermuxOverlayManager {
             mOverlayView = null;
             mTerminalView = null;
             mGripView = null;
+            mExtraKeysView = null;
             mWindowBackground = null;
         }
 
@@ -735,6 +762,9 @@ public final class TermuxOverlayManager {
         mTerminalView = root.findViewById(R.id.overlay_terminal_view);
         mGripView = root.findViewById(R.id.overlay_grip);
         mChromeKey = -1;
+        mExtraKeysVisible = false;
+        mExtraKeysInset = 0;
+        mExtraKeysHeight = 0;
 
         // Once the IME closes, stop owning input so the app behind gets focus back immediately.
         ViewCompat.setOnApplyWindowInsetsListener(root, (v, insets) -> {
@@ -766,6 +796,15 @@ public final class TermuxOverlayManager {
         mTerminalView.setKeepScreenOn(screenPreferences == null || screenPreferences.shouldKeepScreenOn());
         mTerminalView.attachSession(mSession);
         setSheetContentHeight(expandedHeight());
+
+        // Extra keys row: same layout as the main app, summoned by long-pressing the handle.
+        mExtraKeysView = root.findViewById(R.id.overlay_extra_keys);
+        if (mExtraKeysView != null) {
+            mExtraKeysView.setExtraKeysViewClient(new TerminalExtraKeys(mTerminalView));
+            reloadExtraKeys();
+            AppTypeface.applyToViewTree(mExtraKeysView);
+        }
+
         mTerminalView.setOnKeyListener((v, keyCode, event) -> {
             if (keyCode == KeyEvent.KEYCODE_BACK) {
                 if (event.getAction() == KeyEvent.ACTION_UP) hide();
@@ -899,7 +938,10 @@ public final class TermuxOverlayManager {
         if (collapsed != mCollapsed) {
             mCollapsed = collapsed;
             sExpanded = mVisible && !collapsed;
-            if (collapsed) releaseKeyboardFocus();
+            if (collapsed) {
+                releaseKeyboardFocus();
+                hideExtraKeysImmediate();
+            }
             // The blur only makes sense behind a visible panel, not behind the bare grab handle.
             applyWindowBackgroundBlur();
             updateCursorBlinker(!collapsed);
@@ -944,13 +986,160 @@ public final class TermuxOverlayManager {
     }
 
     /**
-     * Sizes the sheet content to its resting height (the sheet height minus the grab handle). It is
-     * changed once per gesture/animation, not per frame, so the terminal is clipped (not reflowed,
-     * which would spam the PTY with SIGWINCH) while the window height animates.
+     * Loads the extra keys layout from the app properties, so the floating terminal uses the same
+     * keys as the main app's terminal toolbar.
+     */
+    private void reloadExtraKeys() {
+        if (mExtraKeysView == null) return;
+
+        TermuxAppSharedProperties properties = TermuxAppSharedProperties.getProperties();
+        ExtraKeysInfo info = null;
+        if (properties != null) {
+            try {
+                String extraKeys = (String) properties.getInternalPropertyValue(
+                    TermuxPropertyConstants.KEY_EXTRA_KEYS, true);
+                String extraKeysStyle = (String) properties.getInternalPropertyValue(
+                    TermuxPropertyConstants.KEY_EXTRA_KEYS_STYLE, true);
+                ExtraKeysConstants.ExtraKeyDisplayMap displayMap =
+                    ExtraKeysInfo.getCharDisplayMapForStyle(extraKeysStyle);
+                if (ExtraKeysConstants.EXTRA_KEY_DISPLAY_MAPS.DEFAULT_CHAR_DISPLAY.equals(displayMap)
+                    && !TermuxPropertyConstants.DEFAULT_IVALUE_EXTRA_KEYS_STYLE.equals(extraKeysStyle)) {
+                    extraKeysStyle = TermuxPropertyConstants.DEFAULT_IVALUE_EXTRA_KEYS_STYLE;
+                }
+                info = new ExtraKeysInfo(extraKeys, extraKeysStyle, ExtraKeysConstants.CONTROL_CHARS_ALIASES);
+                mExtraKeysView.setButtonTextAllCaps(properties.shouldExtraKeysTextBeAllCaps());
+            } catch (Throwable t) {
+                Logger.logStackTraceWithMessage(LOG_TAG, "Failed to load the overlay extra keys", t);
+            }
+        }
+        if (info == null) {
+            try {
+                info = new ExtraKeysInfo(TermuxPropertyConstants.DEFAULT_IVALUE_EXTRA_KEYS,
+                    TermuxPropertyConstants.DEFAULT_IVALUE_EXTRA_KEYS_STYLE,
+                    ExtraKeysConstants.CONTROL_CHARS_ALIASES);
+            } catch (JSONException e) {
+                Logger.logStackTraceWithMessage(LOG_TAG, "Failed to load the default extra keys", e);
+                return;
+            }
+        }
+
+        float rowHeight = 37.5f * mService.getResources().getDisplayMetrics().density;
+        mExtraKeysView.reload(info, Math.round(rowHeight));
+        float scale = properties == null ? 1f : properties.getTerminalToolbarHeightScaleFactor();
+        mExtraKeysHeight = Math.max(Math.round(rowHeight),
+            Math.round(rowHeight * info.getMatrix().length * scale));
+        setExtraKeysRowHeight(mExtraKeysVisible ? mExtraKeysHeight : 0);
+        mExtraKeysView.setVisibility(mExtraKeysVisible ? View.VISIBLE : View.GONE);
+        if (mExtraKeysVisible) {
+            mExtraKeysInset = mExtraKeysHeight;
+            setSheetContentHeight(currentSheetHeight());
+        }
+    }
+
+    private void toggleExtraKeys() {
+        if (mExtraKeysView == null || mCollapsed || mExtraKeysHeight <= 0) return;
+        setExtraKeysVisible(!mExtraKeysVisible);
+    }
+
+    /** Shows or hides the extra keys row with a short expand/collapse animation. */
+    private void setExtraKeysVisible(boolean visible) {
+        if (mExtraKeysView == null || visible == mExtraKeysVisible) return;
+        mExtraKeysVisible = visible;
+        if (mExtraKeysAnimator != null) {
+            mExtraKeysAnimator.cancel();
+            mExtraKeysAnimator = null;
+        }
+
+        final int full = mExtraKeysHeight;
+        if (visible) {
+            // Reserve the row from the terminal immediately so the PTY is resized only once; the
+            // keys then expand into the reserved space.
+            mExtraKeysInset = full;
+            setSheetContentHeight(currentSheetHeight());
+            mExtraKeysView.setVisibility(View.VISIBLE);
+            mExtraKeysView.setAlpha(0f);
+            setExtraKeysRowHeight(0);
+
+            ValueAnimator animator = ValueAnimator.ofInt(0, full);
+            animator.setDuration(200);
+            animator.setInterpolator(new DecelerateInterpolator(1.5f));
+            animator.addUpdateListener(a -> {
+                int height = (int) a.getAnimatedValue();
+                setExtraKeysRowHeight(height);
+                mExtraKeysView.setAlpha(full == 0 ? 1f : height / (float) full);
+            });
+            animator.addListener(new AnimatorListenerAdapter() {
+                @Override
+                public void onAnimationEnd(Animator animation) {
+                    if (mExtraKeysAnimator == animation) mExtraKeysAnimator = null;
+                    setExtraKeysRowHeight(full);
+                    mExtraKeysView.setAlpha(1f);
+                }
+            });
+            mExtraKeysAnimator = animator;
+            animator.start();
+        } else {
+            int start = Math.max(0, mExtraKeysView.getLayoutParams().height);
+            ValueAnimator animator = ValueAnimator.ofInt(start, 0);
+            animator.setDuration(160);
+            animator.setInterpolator(new DecelerateInterpolator(1.5f));
+            animator.addUpdateListener(a -> {
+                int height = (int) a.getAnimatedValue();
+                setExtraKeysRowHeight(height);
+                mExtraKeysView.setAlpha(full == 0 ? 0f : height / (float) full);
+            });
+            animator.addListener(new AnimatorListenerAdapter() {
+                @Override
+                public void onAnimationEnd(Animator animation) {
+                    if (mExtraKeysAnimator == animation) mExtraKeysAnimator = null;
+                    mExtraKeysView.setVisibility(View.GONE);
+                    setExtraKeysRowHeight(0);
+                    mExtraKeysInset = 0;
+                    setSheetContentHeight(currentSheetHeight());
+                }
+            });
+            mExtraKeysAnimator = animator;
+            animator.start();
+        }
+    }
+
+    private void setExtraKeysRowHeight(int height) {
+        if (mExtraKeysView == null) return;
+        ViewGroup.LayoutParams params = mExtraKeysView.getLayoutParams();
+        if (params != null && params.height != height) {
+            params.height = height;
+            mExtraKeysView.setLayoutParams(params);
+        }
+    }
+
+    /** Hides the keys without animating, used when the sheet is rolled up or torn down. */
+    private void hideExtraKeysImmediate() {
+        if (mExtraKeysAnimator != null) {
+            mExtraKeysAnimator.cancel();
+            mExtraKeysAnimator = null;
+        }
+        mExtraKeysVisible = false;
+        mExtraKeysInset = 0;
+        if (mExtraKeysView != null) {
+            setExtraKeysRowHeight(0);
+            mExtraKeysView.setAlpha(1f);
+            mExtraKeysView.setVisibility(View.GONE);
+        }
+    }
+
+    private int currentSheetHeight() {
+        return mOverlayParams == null ? expandedHeight() : mOverlayParams.height;
+    }
+
+    /**
+     * Sizes the sheet content to its resting height (the sheet height minus the grab handle and,
+     * when shown, the extra keys row). It is changed once per gesture/animation, not per frame, so
+     * the terminal is clipped (not reflowed, which would spam the PTY with SIGWINCH) while the
+     * window height animates.
      */
     private void setSheetContentHeight(int sheetHeight) {
         if (mSheetContent == null) return;
-        int height = Math.max(0, sheetHeight - peekHeight());
+        int height = Math.max(0, sheetHeight - peekHeight() - mExtraKeysInset);
         android.view.ViewGroup.LayoutParams params = mSheetContent.getLayoutParams();
         if (params != null && params.height != height) {
             params.height = height;
@@ -1026,16 +1215,26 @@ public final class TermuxOverlayManager {
 
     private void setupDragHandle(View handle) {
         if (handle == null) return;
+        final View handleView = handle;
         final int touchSlop = ViewConfiguration.get(mService).getScaledTouchSlop();
         // A slightly higher bar than the platform minimum so a small jitter does not fling.
         final int minFling = Math.max(ViewConfiguration.get(mService).getScaledMinimumFlingVelocity(),
             dp(120));
+        final int longPressTimeout = ViewConfiguration.getLongPressTimeout();
 
         handle.setOnTouchListener(new View.OnTouchListener() {
             private float downRawY;
             private int startHeight;
             private boolean dragging;
+            private boolean longPressed;
             private VelocityTracker tracker;
+
+            private final Runnable longPressRunnable = () -> {
+                if (dragging || mCollapsed || mExtraKeysView == null) return;
+                longPressed = true;
+                handleView.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS);
+                toggleExtraKeys();
+            };
 
             @Override
             public boolean onTouch(View v, MotionEvent event) {
@@ -1046,13 +1245,19 @@ public final class TermuxOverlayManager {
                         downRawY = event.getRawY();
                         startHeight = mOverlayParams.height;
                         dragging = false;
+                        longPressed = false;
+                        mHandler.removeCallbacks(longPressRunnable);
+                        mHandler.postDelayed(longPressRunnable, longPressTimeout);
                         tracker = VelocityTracker.obtain();
                         tracker.addMovement(event);
                         return true;
                     case MotionEvent.ACTION_MOVE: {
                         if (tracker != null) tracker.addMovement(event);
                         float dy = event.getRawY() - downRawY;
-                        if (!dragging && Math.abs(dy) > touchSlop) dragging = true;
+                        if (!dragging && Math.abs(dy) > touchSlop) {
+                            dragging = true;
+                            mHandler.removeCallbacks(longPressRunnable);
+                        }
                         if (!dragging) return true;
                         // Dragging down grows the sheet, dragging up rolls it towards the handle.
                         setSheetHeight(startHeight + Math.round(dy));
@@ -1060,6 +1265,8 @@ public final class TermuxOverlayManager {
                     }
                     case MotionEvent.ACTION_UP:
                     case MotionEvent.ACTION_CANCEL: {
+                        mHandler.removeCallbacks(longPressRunnable);
+
                         float velocityY = 0f;
                         if (tracker != null) {
                             tracker.addMovement(event);
@@ -1068,6 +1275,13 @@ public final class TermuxOverlayManager {
                             tracker.recycle();
                             tracker = null;
                         }
+
+                        if (longPressed && !dragging) {
+                            // The long press already toggled the extra keys; don't collapse.
+                            longPressed = false;
+                            return true;
+                        }
+                        longPressed = false;
 
                         if (!dragging) {
                             // A tap on the handle toggles the sheet.
