@@ -10,6 +10,7 @@ Nascence 是一个基于 [Termux](https://github.com/termux/termux-app) 的 Andr
 
 ### 现代化终端与渲染
 - 内置 JetBrains Mono + Noto Sans CJK，中文不再拉伸
+- 默认启用 `enforce-char-based-input`，Gboard 等输入法（含实体键盘）可正常组合输入中文/日文/韩文；需要旧的原始按键行为时可在 `termux.properties` 里设为 `false`
 - App 跟随 `~/.termux/font.ttf`
 - OSC 8 可点击超链接、OSC 7 当前目录、OSC 133 提示符标记
 - OSC 9, 99, 777 通知，OSC 9;4 任务进度
