@@ -1175,10 +1175,9 @@ public final class TermuxOverlayManager {
 
     private void updateOverlayBackground() {
         if (mWindowBackground == null) return;
-        // No solid fill while the system blurs what is behind the window: the panel is just the
-        // blur plus the 1dp border. Keep a dim fallback only when cross-window blur is unavailable,
-        // otherwise the text would float straight over the app behind.
-        mWindowBackground.setColor(mBlurEnabled ? Color.TRANSPARENT : 0xB0000000);
+        // A slight dark scrim over the cross-window blur; the panel itself has no opaque fill.
+        // Keep a stronger fallback when blur is unavailable so the text stays readable.
+        mWindowBackground.setColor(mBlurEnabled ? 0x33000000 : 0xB0000000);
     }
 
     /**
