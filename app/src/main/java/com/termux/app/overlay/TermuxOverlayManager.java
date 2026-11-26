@@ -920,7 +920,7 @@ public final class TermuxOverlayManager {
     }
 
     /**
-     * Fades the panel and the terminal out as the sheet rolls into its grab handle, so the
+     * Fades the border and the terminal out as the sheet rolls into its grab handle, so the
      * collapsed state is just the bare handle floating over whatever is behind it. At zero
      * opacity the content is made INVISIBLE: it keeps its layout size (and therefore the PTY
      * size) but stops being drawn at all. The handle is a separate view and is not affected.
@@ -1175,9 +1175,10 @@ public final class TermuxOverlayManager {
 
     private void updateOverlayBackground() {
         if (mWindowBackground == null) return;
-        // The blur (or the dim when blurs are off) shows through this alpha.
-        int alpha = mBlurEnabled ? 168 : 240;
-        mWindowBackground.setColor((alpha << 24) | (mPanelRgb & 0xFFFFFF));
+        // No solid fill while the system blurs what is behind the window: the panel is just the
+        // blur plus the 1dp border. Keep a dim fallback only when cross-window blur is unavailable,
+        // otherwise the text would float straight over the app behind.
+        mWindowBackground.setColor(mBlurEnabled ? Color.TRANSPARENT : 0xB0000000);
     }
 
     /**

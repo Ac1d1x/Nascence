@@ -1,9 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Background of the floating terminal. Its alpha is lowered at runtime when the system's
-     cross-window blur is available, so the blurred content behind stays visible. -->
+<!-- Border and shape of the floating terminal. There is deliberately no solid fill: the panel is
+     just the live background blur plus this 1dp border, so the outline also defines the blur
+     region. Its alpha is lowered at runtime while the sheet is rolled up, which fades the border
+     out with the panel. -->
 <shape xmlns:android="http://schemas.android.com/apk/res/android"
     android:shape="rectangle">
-    <solid android:color="#F20B0D12" />
+    <solid android:color="@android:color/transparent" />
     <corners android:radius="18dp" />
     <stroke
         android:width="1dp"
